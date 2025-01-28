@@ -1,10 +1,10 @@
 # Description:
 # TensorFlow Java API.
 
-load(":build_defs.bzl", "JAVACOPTS")
-load(":src/gen/gen_ops.bzl", "tf_java_op_gen_srcjar")
+load("@rules_java//java:defs.bzl", "java_library", "java_plugin")
 load(
     "//tensorflow:tensorflow.bzl",
+    "VERSION",
     "tf_binary_additional_srcs",
     "tf_cc_binary",
     "tf_cc_test",
@@ -12,10 +12,13 @@ load(
     "tf_custom_op_library",
     "tf_java_test",
 )
+load(":build_defs.bzl", "JAVACOPTS")
+load(":src/gen/gen_ops.bzl", "tf_java_op_gen_srcjar")
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     default_visibility = ["//visibility:private"],
-    licenses = ["notice"],  # Apache 2.0
+    licenses = ["notice"],
 )
 
 java_library(
@@ -27,7 +30,21 @@ java_library(
     data = tf_binary_additional_srcs() + [":libtensorflow_jni"],
     javacopts = JAVACOPTS,
     plugins = [":processor"],
+    resources = [":java_resources"],
     visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "version-info",
+    outs = ["src/main/resources/tensorflow-version-info"],
+    cmd = "echo version=%s > $@" % VERSION,
+    output_to_bindir = 1,
+)
+
+filegroup(
+    name = "java_resources",
+    srcs = [":version-info"],
+    visibility = ["//visibility:private"],
 )
 
 # NOTE(ashankar): Rule to include the Java API in the Android Inference Library
@@ -38,10 +55,7 @@ filegroup(
         "src/main/java/org/tensorflow/*.java",
         "src/main/java/org/tensorflow/types/*.java",
     ]),
-    visibility = [
-        "//tensorflow/contrib/android:__pkg__",
-        "//tensorflow/java:__pkg__",
-    ],
+    visibility = ["//tensorflow/tools/android/inference_interface:__pkg__"],
 )
 
 java_plugin(
@@ -66,9 +80,7 @@ java_library(
 filegroup(
     name = "java_op_sources",
     srcs = glob(["src/main/java/org/tensorflow/op/**/*.java"]) + [":java_op_gen_sources"],
-    visibility = [
-        "//tensorflow/java:__pkg__",
-    ],
+    visibility = ["//visibility:private"],
 )
 
 tf_java_op_gen_srcjar(
@@ -98,6 +110,9 @@ tf_cc_binary(
         "//tensorflow/core:framework_internal",
         "//tensorflow/core:lib",
         "//tensorflow/core:ops",
+        "//tensorflow/core:protos_all_cc",
+        "@com_google_absl//absl/log:check",
+        "@local_tsl//tsl/platform:status",
     ],
 )
 
@@ -122,6 +137,8 @@ cc_library(
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:op_gen_lib",
         "//tensorflow/core:protos_all_cc",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
         "@com_googlesource_code_re2//:re2",
     ],
 )
@@ -428,6 +445,9 @@ tf_cc_binary(
             "-z defs",
             "-s",
             "-Wl,--version-script,$(location {})".format(LINKER_VERSION_SCRIPT),
+            # copybara:uncomment_begin(google-only)
+            # "-Wl,--undefined-version",
+            # copybara:uncomment_end
         ],
     }),
     linkshared = 1,

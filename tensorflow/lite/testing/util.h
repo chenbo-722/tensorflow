@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "tensorflow/lite/core/api/error_reporter.h"
 #include "tensorflow/lite/string_type.h"
+#include "tsl/platform/logging.h"
 
 namespace tflite {
 
@@ -50,7 +51,7 @@ class TestErrorReporter : public ErrorReporter {
 
 inline void LogToStderr() {
 #ifdef PLATFORM_GOOGLE
-  FLAGS_logtostderr = true;
+  absl::SetFlag(&FLAGS_logtostderr, true);
 #endif
 }
 

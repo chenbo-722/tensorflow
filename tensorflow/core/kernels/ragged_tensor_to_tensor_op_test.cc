@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
 #include "tensorflow/core/framework/attr_value_util.h"
 #include "tensorflow/core/framework/fake_input.h"
 #include "tensorflow/core/framework/node_def_builder.h"
@@ -21,6 +22,7 @@ limitations under the License.
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_testutil.h"
 #include "tensorflow/core/kernels/ops_testutil.h"
+#include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/test.h"
 
 namespace tensorflow {
@@ -34,7 +36,7 @@ struct ShapeAndValues {
 
 template <typename VALUE_TYPE>
 ShapeAndValues<VALUE_TYPE> createVector(const std::vector<VALUE_TYPE>& values) {
-  TensorShape shape({static_cast<int64>(values.size())});
+  TensorShape shape({static_cast<int64_t>(values.size())});
   return {shape, values};
 }
 
@@ -214,14 +216,14 @@ TEST_F(RaggedTensorToTensorOpTest, RaggedTensorToTensor_3DParamsRowSplits2) {
   //           [],
   //           [[3]]
   //          ]
-  BuildRaggedTensorToTensorGraph<int64, int64>(
-      TensorShape({3, 2, 3}),             // shape
-      {"ROW_SPLITS", "ROW_SPLITS"},       // row_partition_types
-      createVector<int64>({0, 1, 2, 3}),  // values
-      createScalar<int64>(5),             // default_value
+  BuildRaggedTensorToTensorGraph<int64_t, int64_t>(
+      TensorShape({3, 2, 3}),               // shape
+      {"ROW_SPLITS", "ROW_SPLITS"},         // row_partition_types
+      createVector<int64_t>({0, 1, 2, 3}),  // values
+      createScalar<int64_t>(5),             // default_value
       {
-          createVector<int64>({0, 2, 2, 3}),
-          createVector<int64>({0, 3, 3, 4}),
+          createVector<int64_t>({0, 2, 2, 3}),
+          createVector<int64_t>({0, 3, 3, 4}),
       }  // row_partition_tensors
   );
   TF_ASSERT_OK(RunOpKernel());
@@ -231,8 +233,8 @@ TEST_F(RaggedTensorToTensorOpTest, RaggedTensorToTensor_3DParamsRowSplits2) {
   //              [[5, 5, 5], [5, 5, 5]],
   //              [[3, 5, 5], [5, 5, 5]]
   //            ]
-  test::ExpectTensorEqual<int64>(
-      *GetOutput(0), test::AsTensor<int64>(
+  test::ExpectTensorEqual<int64_t>(
+      *GetOutput(0), test::AsTensor<int64_t>(
                          {0, 1, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 3, 5, 5, 5, 5, 5},
                          TensorShape({3, 2, 3})));
 }
@@ -499,16 +501,16 @@ TEST_F(RaggedTensorToTensorOpTest, ShapeWrongDimensions) {
        createVector<int32>({1, 1, 1, 2})}  // row_partition_tensors
   );
   // Fails with an invalid argument.
-  EXPECT_EQ(RunOpKernel().code(), errors::Code::INVALID_ARGUMENT);
+  EXPECT_EQ(errors::IsInvalidArgument(RunOpKernel()), true);
 }
 
 class RaggedTensorToTensorOpUnknownShapeTest
     : public ::tensorflow::OpsTestBase {
  protected:
   std::unique_ptr<ShapeInferenceTestOp> op_;
-  void SetAttributes(const gtl::ArraySlice<string> row_partition_types,
+  void SetAttributes(const absl::Span<const string> row_partition_types,
                      int num_row_partition_tensors) {
-    op_ = absl::make_unique<ShapeInferenceTestOp>("RaggedTensorToTensor");
+    op_ = std::make_unique<ShapeInferenceTestOp>("RaggedTensorToTensor");
     SetAttrValue(row_partition_types,
                  &((*op_->node_def.mutable_attr())["row_partition_types"]));
     (*op_->node_def.mutable_attr())["num_row_partition_tensors"].set_i(
@@ -517,7 +519,7 @@ class RaggedTensorToTensorOpUnknownShapeTest
 };
 
 TEST_F(RaggedTensorToTensorOpUnknownShapeTest, ValueRowIDs) {
-  SetAttributes(gtl::ArraySlice<string>{"FIRST_DIM_SIZE", "VALUE_ROWIDS"}, 2);
+  SetAttributes(absl::Span<const string>{"FIRST_DIM_SIZE", "VALUE_ROWIDS"}, 2);
 
   INFER_OK(*op_, "?;?;?;?;?", "?");
   INFER_OK(*op_, "?;[6];[];[];[6]", "[?,?]");
@@ -527,10 +529,14 @@ TEST_F(RaggedTensorToTensorOpUnknownShapeTest, ValueRowIDs) {
   INFER_OK(*op_, "?;[6,2];?;[];[6]", "[?,?,2]");
   INFER_OK(*op_, "?;[6,2];[2];[];[6]", "[?,?,2]");
   INFER_OK(*op_, "?;[6,2,7];[2,7];[];[6]", "[?,?,2,7]");
-  INFER_ERROR("default_value_shape and value_shape do not match", *op_,
-              "?;[6,2];[3];[];[6]");
-  INFER_ERROR("default_value_shape and value_shape do not match", *op_,
-              "?;[6,2,1,2];[2,2];[];[6]");
+  INFER_ERROR(
+      "default_value.shape=[3] and rt_input.flat_values.shape=[6,2] "
+      "are incompatible",
+      *op_, "?;[6,2];[3];[];[6]");
+  INFER_ERROR(
+      "default_value.shape=[2,2] and rt_input.flat_values.shape="
+      "[6,2,1,2] are incompatible",
+      *op_, "?;[6,2,1,2];[2,2];[];[6]");
   INFER_ERROR("must be a vector", *op_, "?;[6];[];[];[3,6]");
   INFER_ERROR("must be a scalar", *op_, "?;[6];[];[7];[3]");
 }
@@ -538,7 +544,7 @@ TEST_F(RaggedTensorToTensorOpUnknownShapeTest, ValueRowIDs) {
 TEST_F(RaggedTensorToTensorOpUnknownShapeTest, RowSplits) {
   // RaggedTensorToTensor(param_splits+, param_values, indices) -> [splits+,
   // values]
-  SetAttributes(gtl::ArraySlice<string>{"ROW_SPLITS"}, 1);
+  SetAttributes(absl::Span<const string>{"ROW_SPLITS"}, 1);
 
   // value, default_value, ROW_SPLITS
   INFER_OK(*op_, "?;?;?;?", "?");

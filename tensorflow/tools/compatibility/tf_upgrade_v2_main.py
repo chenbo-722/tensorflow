@@ -14,22 +14,22 @@
 # ==============================================================================
 """Upgrader for Python scripts from 1.x TensorFlow to 2.0 TensorFlow."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
 
 from tensorflow.tools.compatibility import ast_edits
 from tensorflow.tools.compatibility import ipynb
 from tensorflow.tools.compatibility import tf_upgrade_v2
 from tensorflow.tools.compatibility import tf_upgrade_v2_safety
+
 # Make straightforward changes to convert to 2.0. In harder cases,
 # use compat.v1.
 _DEFAULT_MODE = "DEFAULT"
 
 # Convert to use compat.v1.
 _SAFETY_MODE = "SAFETY"
+
+# Whether to rename to compat.v2
+_IMPORT_RENAME_DEFAULT = False
 
 
 def process_file(in_filename, out_filename, upgrader):
@@ -92,6 +92,19 @@ Simple usage:
             "input files."),
       action="store_true")
   parser.add_argument(
+      "--no_import_rename",
+      dest="no_import_rename",
+      help=("Not to rename import to compat.v2 explicitly."),
+      action="store_true")
+  parser.add_argument(
+      "--no_upgrade_compat_v1_import",
+      dest="no_upgrade_compat_v1_import",
+      help=("If specified, don't upgrade explicit imports of "
+            "`tensorflow.compat.v1 as tf` to the v2 APIs. Otherwise, "
+            "explicit imports of  the form `tensorflow.compat.v1 as tf` will "
+            "be upgraded."),
+      action="store_true")
+  parser.add_argument(
       "--reportfile",
       dest="report_filename",
       help=("The name of the file where the report log is "
@@ -106,8 +119,7 @@ Simple usage:
             "%s: Perform only straightforward conversions to upgrade to "
             "2.0. In more difficult cases, switch to use compat.v1.\n"
             "%s: Keep 1.* code intact and import compat.v1 "
-            "module. Also disable 2.0 behavior to ensure code "
-            "that requires 1.X behavior continues to work." %
+            "module." %
             (_DEFAULT_MODE, _SAFETY_MODE)),
       default=_DEFAULT_MODE)
   parser.add_argument(
@@ -120,7 +132,14 @@ Simple usage:
   if args.mode == _SAFETY_MODE:
     change_spec = tf_upgrade_v2_safety.TFAPIChangeSpec()
   else:
-    change_spec = tf_upgrade_v2.TFAPIChangeSpec()
+    if args.no_import_rename:
+      change_spec = tf_upgrade_v2.TFAPIChangeSpec(
+          import_rename=False,
+          upgrade_compat_v1_import=not args.no_upgrade_compat_v1_import)
+    else:
+      change_spec = tf_upgrade_v2.TFAPIChangeSpec(
+          import_rename=_IMPORT_RENAME_DEFAULT,
+          upgrade_compat_v1_import=not args.no_upgrade_compat_v1_import)
   upgrade = ast_edits.ASTCodeUpgrader(change_spec)
 
   report_text = None
@@ -132,8 +151,7 @@ Simple usage:
           "--outfile=<output file> argument is required when converting a "
           "single file.")
     if args.in_place and args.output_file:
-      raise ValueError(
-          "--outfile argument is invalid when when converting in place")
+      raise ValueError("--outfile argument is invalid when converting in place")
     output_file = args.input_file if args.in_place else args.output_file
     files_processed, report_text, errors = process_file(
         args.input_file, output_file, upgrade)
@@ -145,8 +163,7 @@ Simple usage:
           "--outtree=<output directory> argument is required when converting a "
           "file tree.")
     if args.in_place and args.output_tree:
-      raise ValueError(
-          "--outtree argument is invalid when when converting in place")
+      raise ValueError("--outtree argument is invalid when converting in place")
     output_tree = args.input_tree if args.in_place else args.output_tree
     files_processed, report_text, errors = upgrade.process_tree(
         args.input_tree, output_tree, args.copy_other_files)

@@ -15,33 +15,46 @@ limitations under the License.
 
 #include "tensorflow/compiler/mlir/tensorflow/transforms/bridge.h"
 
-#include "mlir/Pass/PassManager.h"  // TF:local_config_mlir
-#include "mlir/Transforms/Passes.h"  // TF:local_config_mlir
+#include "absl/log/log.h"
+#include "llvm/ADT/StringRef.h"
+#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/Pass/PassManager.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/tensorflow/transforms/passes.h"
+#include "tensorflow/compiler/mlir/tensorflow/utils/dump_mlir_util.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/error_util.h"
+#include "tensorflow/compiler/mlir/tf2xla/internal/logging_hooks.h"
+#include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/protobuf/core_platform_payloads.pb.h"
 
 namespace mlir {
-namespace TFTPU {
+namespace TF {
 
-void createTPUBridge(PassManager &bridge) {
-  bridge.addPass(tf_executor::CreateTFExecutorIslandCoarseningPass());
-  bridge.addPass(createCanonicalizerPass());
-  bridge.addPass(CreateTPUClusterFormationPass());
-  bridge.addPass(TFDevice::CreateClusterOutliningPass());
-  bridge.addPass(CreateTPURewritePass());
-}
-
-tensorflow::Status TPUBridge(ModuleOp module) {
-  // Populate a passmanager with the list of passes that implement the bridge.
+absl::Status RunBridgeWithStandardPipeline(ModuleOp module, bool enable_logging,
+                                           bool enable_inliner) {
   PassManager bridge(module.getContext());
-  createTPUBridge(bridge);
 
-  // Run the bridge on the module, in case of failure, the `diag_handler`
-  // converts MLIR errors emitted to the MLIRContext into a tensorflow::Status.
-  mlir::StatusScopedDiagnosticHandler diag_handler(module.getContext());
-  if (failed(bridge.run(module))) return diag_handler.ConsumeStatus();
+  StandardPipelineOptions pipeline_options;
+  pipeline_options.enable_inliner.setValue(enable_inliner);
+  CreateTFStandardPipeline(bridge, pipeline_options);
+
+  mlir::StatusScopedDiagnosticHandler diag_handler(
+      module.getContext(), /*propagate=*/false,
+      /*filter_stack=*/!VLOG_IS_ON(1));
+
+  constexpr char kBridgeComponent[] = "TFXLABridge";
+  if (enable_logging || VLOG_IS_ON(1)) {
+    tensorflow::DumpMlirOpToFile(kStandardPipelineBefore, module, "", &bridge);
+    if (VLOG_IS_ON(2)) {
+      tensorflow::tf2xla::internal::EnablePassIRPrinting(bridge,
+                                                         kBridgeComponent);
+    }
+  }
+  LogicalResult result = bridge.run(module);
+  (void)result;
+  if (enable_logging || VLOG_IS_ON(1))
+    tensorflow::DumpMlirOpToFile(kStandardPipelineAfter, module, "", &bridge);
   return diag_handler.ConsumeStatus();
 }
 
-}  // namespace TFTPU
+}  // namespace TF
 }  // namespace mlir

@@ -14,10 +14,6 @@
 # ==============================================================================
 """Module deprecation warnings for TensorFlow 2.0."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from tensorflow.tools.compatibility import ast_edits
 
 
@@ -30,9 +26,8 @@ _CONTRIB_WARNING = (
 
 _FLAGS_WARNING = (
     ast_edits.ERROR,
-    "tf.flags has been removed, please use the argparse or absl"
-    " modules if you need command line parsing."
-)
+    "tf.flags and tf.app.flags have been removed, please use the argparse or "
+    "absl modules if you need command line parsing.")
 
 _CONTRIB_CUDNN_RNN_WARNING = (
     ast_edits.WARNING,
@@ -65,6 +60,7 @@ MODULE_DEPRECATIONS = {
     "tf.contrib.cudnn_rnn": _CONTRIB_CUDNN_RNN_WARNING,
     "tf.contrib.rnn": _CONTRIB_RNN_WARNING,
     "tf.flags": _FLAGS_WARNING,
+    "tf.app.flags": _FLAGS_WARNING,
     "tf.contrib.distribute": _CONTRIB_DIST_STRAT_WARNING,
     "tf.contrib.seq2seq": _CONTRIB_SEQ2SEQ_WARNING
 }

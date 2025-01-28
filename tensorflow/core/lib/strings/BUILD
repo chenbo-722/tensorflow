@@ -1,13 +1,40 @@
-package(
-    default_visibility = [
-        "//tensorflow:__subpackages__",
-    ],
-    licenses = ["notice"],  # Apache 2.0
+load("//tensorflow:tensorflow.default.bzl", "filegroup")
+load(
+    "//tensorflow/core/platform:rules_cc.bzl",
+    "cc_library",
 )
 
-# Todo(bmzhao): Remaining targets to add to this BUILD file are:
-# base64, proto_serialization, proto_text_util, and all tests.
-# Note: proto_serialization depends on target lib/hash:hash being added.
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    default_visibility = [
+        # tensorflow/core:lib effectively exposes all targets under tensorflow/core/lib/**
+        "//tensorflow/core:__pkg__",
+        # tensorflow/core/framework references some of the headers in this package
+        "//tensorflow/core/framework:__subpackages__",
+        "//tensorflow/core/tpu:__subpackages__",
+        # For proto_serialization library
+        "//tensorflow/cc/experimental/tf2:__subpackages__",
+        #For ordered_code library
+        "//tensorflow/python/profiler/internal:__pkg__",
+    ],
+    licenses = ["notice"],
+)
+
+# Todo(bmzhao): Remaining targets to add to this BUILD file are: all tests.
+
+cc_library(
+    name = "base64",
+    hdrs = ["base64.h"],
+    deps = [
+        "//tensorflow/core/platform:base64",
+    ],
+)
+
+cc_library(
+    name = "numbers",
+    hdrs = ["numbers.h"],
+    deps = ["//tensorflow/core/platform:numbers"],
+)
 
 cc_library(
     name = "ordered_code",
@@ -18,6 +45,30 @@ cc_library(
         "//tensorflow/core/platform:macros",
         "//tensorflow/core/platform:stringpiece",
         "//tensorflow/core/platform:types",
+        "@local_xla//xla/tsl/lib/core:bits",
+    ],
+)
+
+cc_library(
+    name = "proto_serialization",
+    hdrs = ["proto_serialization.h"],
+    deps = [
+        "@local_xla//xla/tsl/lib/strings:proto_serialization",
+    ],
+)
+
+cc_library(
+    name = "proto_text_util",
+    srcs = ["proto_text_util.cc"],
+    hdrs = ["proto_text_util.h"],
+    deps = [
+        "//tensorflow/core/lib/strings:scanner",
+        "//tensorflow/core/platform:macros",
+        "//tensorflow/core/platform:numbers",
+        "//tensorflow/core/platform:protobuf",
+        "//tensorflow/core/platform:str_util",
+        "//tensorflow/core/platform:strcat",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -28,23 +79,48 @@ cc_library(
 )
 
 cc_library(
-    name = "string_utils",
-    hdrs = [
-        "numbers.h",
-        "str_util.h",
-        "strcat.h",
-    ],
-    deps = [
-        "//tensorflow/core/platform:numbers",
-        "//tensorflow/core/platform:str_util",
-        "//tensorflow/core/platform:strcat",
-    ],
+    name = "str_util",
+    hdrs = ["str_util.h"],
+    deps = ["//tensorflow/core/platform:str_util"],
+)
+
+cc_library(
+    name = "strcat",
+    hdrs = ["strcat.h"],
+    deps = ["//tensorflow/core/platform:strcat"],
 )
 
 cc_library(
     name = "stringprintf",
     hdrs = ["stringprintf.h"],
     deps = ["//tensorflow/core/platform:stringprintf"],
+)
+
+# Export source files needed for mobile builds, which do not use granular targets.
+filegroup(
+    name = "mobile_srcs_no_runtime",
+    srcs = [
+        "proto_text_util.cc",
+        "proto_text_util.h",
+        "scanner.h",
+        "str_util.h",
+        "strcat.h",
+        "stringprintf.h",
+    ],
+    visibility = ["//tensorflow/core:__pkg__"],
+)
+
+filegroup(
+    name = "mobile_srcs_only_runtime",
+    srcs = [
+        "base64.h",
+        "numbers.h",
+        "ordered_code.cc",
+        "ordered_code.h",
+        "proto_serialization.h",
+        "@local_xla//xla/tsl/lib/strings:mobile_srcs_only_runtime",
+    ],
+    visibility = ["//tensorflow/core:__pkg__"],
 )
 
 filegroup(
@@ -59,17 +135,7 @@ filegroup(
         "str_util.h",
         "strcat.h",
         "stringprintf.h",
-    ],
-    visibility = ["//tensorflow/core:__pkg__"],
-)
-
-filegroup(
-    name = "legacy_lib_strings_all_srcs",
-    srcs = [
-        "base64.cc",
-        "ordered_code.cc",
-        "proto_serialization.cc",
-        "proto_text_util.cc",
+        "@local_xla//xla/tsl/lib/strings:legacy_lib_strings_all_headers",
     ],
     visibility = ["//tensorflow/core:__pkg__"],
 )
@@ -101,6 +167,7 @@ filegroup(
         "str_util.h",
         "strcat.h",
         "stringprintf.h",
+        "@local_xla//xla/tsl/lib/strings:legacy_lib_string_headers",
     ],
     visibility = ["//tensorflow/core:__pkg__"],
 )
@@ -113,15 +180,7 @@ filegroup(
         "proto_serialization.h",
         "proto_text_util.h",
         "scanner.h",
-    ],
-    visibility = ["//tensorflow/core:__pkg__"],
-)
-
-filegroup(
-    name = "legacy_lib_android_gif_internal_string_headers",
-    srcs = [
-        "numbers.h",
-        "strcat.h",
+        "@local_xla//xla/tsl/lib/strings:legacy_lib_internal_public_string_headers",
     ],
     visibility = ["//tensorflow/core:__pkg__"],
 )

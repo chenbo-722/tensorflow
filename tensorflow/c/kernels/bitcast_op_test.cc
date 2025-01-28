@@ -13,13 +13,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+#include <initializer_list>
+#include <memory>
+#include <vector>
+
+#include "absl/container/inlined_vector.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/attr_value_util.h"
 #include "tensorflow/core/framework/fake_input.h"
 #include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/framework/node_def_builder.h"
+#include "tensorflow/core/framework/op_def.pb.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
+#include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/platform/test.h"
 
 namespace tensorflow {
@@ -27,19 +36,15 @@ namespace {
 
 class DummyDevice : public DeviceBase {
  public:
-  DummyDevice(Env* env, bool save) : DeviceBase(env), save_(save) {}
-  bool RequiresRecordingAccessedTensors() const override { return save_; }
+  explicit DummyDevice(Env* env) : DeviceBase(env) {}
   Allocator* GetAllocator(AllocatorAttributes /*attr*/) override {
     return cpu_allocator();
   }
-
- private:
-  bool save_;
 };
 
 void TestBitcastOp(Tensor* input_tensor, DataType out_type,
                    TensorShape expected_shape, error::Code expected_code) {
-  Status status;
+  absl::Status status;
   NodeDef def;
   def.set_op("Bitcast");
   def.set_device(DEVICE_CPU);
@@ -61,12 +66,12 @@ void TestBitcastOp(Tensor* input_tensor, DataType out_type,
   ASSERT_TRUE(status.ok()) << status.ToString();
 
   OpKernelContext::Params params;
-  DummyDevice dummy_device(nullptr, false);
+  DummyDevice dummy_device(nullptr);
   params.device = &dummy_device;
   params.op_kernel = kernel.get();
-  gtl::InlinedVector<TensorValue, 4> inputs;
+  absl::InlinedVector<TensorValue, 4UL> inputs;
   inputs.emplace_back(input_tensor);
-  params.inputs = &inputs;
+  params.inputs = inputs;
 
   OpKernelContext ctx(&params);
   kernel->Compute(&ctx);
@@ -100,7 +105,7 @@ TEST(BitcastOpTest, TestImpossibleCast) {
   TestBitcastOp(&int8_input, DT_UINT32, TensorShape(), error::INVALID_ARGUMENT);
 }
 
-PartialTensorShape S(std::initializer_list<int64> dims) {
+PartialTensorShape S(std::initializer_list<int64_t> dims) {
   return PartialTensorShape(dims);
 }
 
@@ -114,7 +119,7 @@ TEST(BitcastOpTest, TestShapeInference_LargerShape) {
                   .Attr("T", DT_INT64)
                   .Input(FakeInput(DT_INT64))
                   .Finalize(&def));
-  shape_inference::InferenceContext c(0, &def, op_def, {S({3, 4})}, {}, {}, {});
+  shape_inference::InferenceContext c(0, def, op_def, {S({3, 4})}, {}, {}, {});
   std::vector<shape_inference::ShapeHandle> input_shapes;
   TF_CHECK_OK(c.input("input", &input_shapes));
   ASSERT_EQ("[3,4]", c.DebugString(input_shapes[0]));
@@ -132,7 +137,7 @@ TEST(BitcastOpTest, TestShapeInference_SmallerShape) {
                   .Attr("T", DT_INT8)
                   .Input(FakeInput(DT_INT8))
                   .Finalize(&def));
-  shape_inference::InferenceContext c(0, &def, op_def, {S({3, 4, 8})}, {}, {},
+  shape_inference::InferenceContext c(0, def, op_def, {S({3, 4, 8})}, {}, {},
                                       {});
   std::vector<shape_inference::ShapeHandle> input_shapes;
   TF_CHECK_OK(c.input("input", &input_shapes));
@@ -151,7 +156,7 @@ TEST(BitcastOpTest, TestShapeInference_SameShape) {
                   .Attr("T", DT_FLOAT)
                   .Input(FakeInput(DT_FLOAT))
                   .Finalize(&def));
-  shape_inference::InferenceContext c(0, &def, op_def, {S({3, 4})}, {}, {}, {});
+  shape_inference::InferenceContext c(0, def, op_def, {S({3, 4})}, {}, {}, {});
   std::vector<shape_inference::ShapeHandle> input_shapes;
   TF_CHECK_OK(c.input("input", &input_shapes));
   ASSERT_EQ("[3,4]", c.DebugString(input_shapes[0]));

@@ -21,7 +21,6 @@ limitations under the License.
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/compiler/jit/encapsulate_util.h"
 #include "tensorflow/compiler/tf2xla/rearrange_function_argument.h"
-#include "tensorflow/compiler/xla/test.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/common_shape_fns.h"
@@ -29,8 +28,8 @@ limitations under the License.
 #include "tensorflow/core/framework/graph_to_functiondef.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/lib/core/error_codes.pb.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/public/version.h"
 
@@ -63,7 +62,7 @@ TEST(RearrangeFunctionArgumentForFunctionTest, Basic) {
     Output arg0 = ops::_Arg(s.WithOpName("arg0"), DT_RESOURCE, 0);
     Output arg1 = ops::_Arg(s.WithOpName("arg1"), DT_BOOL, 1);
     auto ret0 = ops::_Retval(s.WithOpName("ret0"), arg0, 0);
-    auto ret1 = ops::_Retval(s.WithOpName("ret1"), arg1, 0);
+    auto ret1 = ops::_Retval(s.WithOpName("ret1"), arg1, 1);
     std::unique_ptr<Graph> g(new Graph(OpRegistry::Global()));
     TF_CHECK_OK(s.ToGraph(g.get()));
     FunctionDef *xla_fdef = fdl.add_function();
@@ -118,7 +117,7 @@ TEST(RearrangeFunctionArgumentForFunctionTest, Basic) {
                                                    &fld, &new_fbody));
         *fbody = new_fbody.get();
         fbodies.push_back(std::move(new_fbody));
-        return Status::OK();
+        return absl::OkStatus();
       },
       g.get(), &fld));
 
@@ -221,7 +220,7 @@ TEST(RearrangeFunctionArgumentForFunctionTest,
   TF_CHECK_OK(s.ToGraph(g.get()));
 
   std::vector<std::unique_ptr<FunctionBody>> fbodies;
-  Status status = RearrangeFunctionArguments(
+  absl::Status status = RearrangeFunctionArguments(
       [&](const NameAttrList &function, const FunctionBody **fbody) {
         std::unique_ptr<FunctionBody> new_fbody;
         TF_RETURN_IF_ERROR(FunctionDefToBodyHelper(*fld.Find(function.name()),
@@ -229,7 +228,7 @@ TEST(RearrangeFunctionArgumentForFunctionTest,
                                                    &fld, &new_fbody));
         *fbody = new_fbody.get();
         fbodies.push_back(std::move(new_fbody));
-        return Status::OK();
+        return absl::OkStatus();
       },
       g.get(), &fld);
   EXPECT_EQ(status.code(), error::UNIMPLEMENTED);

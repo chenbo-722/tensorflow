@@ -26,8 +26,8 @@ limitations under the License.
 namespace tensorflow {
 namespace grappler {
 
-Status DebugStripper::Optimize(Cluster* cluster, const GrapplerItem& item,
-                               GraphDef* output) {
+absl::Status DebugStripper::Optimize(Cluster* cluster, const GrapplerItem& item,
+                                     GraphDef* output) {
   bool can_optimize = false;
   for (const NodeDef& node : item.graph.node()) {
     if (IsAssert(node) || IsCheckNumerics(node) || IsPrint(node)) {
@@ -41,10 +41,10 @@ Status DebugStripper::Optimize(Cluster* cluster, const GrapplerItem& item,
 
   *output = item.graph;
   for (NodeDef& node : *output->mutable_node()) {
-    if (IsAssert(node)) {
+    if (IsAssert(node) || node.op() == "PrintV2") {
       // Convert this node into a no-op.
       node.set_op("NoOp");
-      node.clear_attr();
+      EraseRegularNodeAttributes(&node);
       // Convert all its inputs into control dependency, which will then
       // be optimized away by dependency optimizer.
       for (string& inp : *node.mutable_input()) {
@@ -52,7 +52,7 @@ Status DebugStripper::Optimize(Cluster* cluster, const GrapplerItem& item,
           inp = AsControlDependency(NodeName(inp));
         }
       }
-    } else if (IsCheckNumerics(node) || IsPrint(node)) {
+    } else if (IsCheckNumerics(node) || node.op() == "Print") {
       // Replace with Identity op which will be pruned later.
       node.set_op("Identity");
       // Only preserve T attribute.
@@ -63,19 +63,14 @@ Status DebugStripper::Optimize(Cluster* cluster, const GrapplerItem& item,
       node.mutable_attr()->swap(new_attr);
       // As Identity op only takes one input, mark redundant inputs as control
       // input.
-      for (size_t i = 1; i < node.input_size(); ++i) {
+      for (int i = 1, end = node.input_size(); i < end; ++i) {
         if (!IsControlInput(node.input(i))) {
           *node.mutable_input(i) = AsControlDependency(NodeName(node.input(i)));
         }
       }
     }
   }
-  return Status::OK();
-}
-
-void DebugStripper::Feedback(Cluster* cluster, const GrapplerItem& item,
-                             const GraphDef& optimize_output, double result) {
-  // Takes no feedback.
+  return absl::OkStatus();
 }
 
 }  // end namespace grappler

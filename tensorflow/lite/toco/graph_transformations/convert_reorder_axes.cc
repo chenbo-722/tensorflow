@@ -17,11 +17,12 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "absl/strings/str_cat.h"
+#include "absl/status/status.h"
+#include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/lite/toco/graph_transformations/graph_transformations.h"
 #include "tensorflow/lite/toco/model.h"
 #include "tensorflow/lite/toco/tooling_util.h"
-#include "tensorflow/core/platform/logging.h"
 
 namespace toco {
 
@@ -41,7 +42,7 @@ TensorFlowReshapeOperator* CreateReshapeFromReorderAxes(
                                    input_shape.dims(3) * input_shape.dims(2)};
 
   // Create a new input array for Reshape.
-  string reshape_array_name =
+  std::string reshape_array_name =
       AvailableArrayName(*model, reshape_op->outputs[0]);
   reshape_op->inputs.push_back(reshape_array_name);
 
@@ -71,7 +72,8 @@ TransposeOperator* CreateTransposeFromReorderAxes(
   GetShuffleShape(input_axes_order, output_axes_order, &permutations_data);
 
   // Create a new input permutations array for Transpose.
-  string perm_array_name = AvailableArrayName(*model, transpose_op->outputs[0]);
+  std::string perm_array_name =
+      AvailableArrayName(*model, transpose_op->outputs[0]);
   transpose_op->inputs.push_back(perm_array_name);
 
   Array& perm_array = model->GetOrCreateArray(perm_array_name);
@@ -86,12 +88,12 @@ TransposeOperator* CreateTransposeFromReorderAxes(
 
 // Converts ReorderAxes into Transpose and Reshape which are compatible with the
 // TFLite interpreter.
-::tensorflow::Status ConvertReorderAxes::Run(Model* model, std::size_t op_index,
-                                             bool* modified) {
+absl::Status ConvertReorderAxes::Run(Model* model, std::size_t op_index,
+                                     bool* modified) {
   *modified = false;
   auto reorder_it = model->operators.begin() + op_index;
   if (reorder_it->get()->type != OperatorType::kReorderAxes)
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
 
   auto* reorder_op = static_cast<ReorderAxesOperator*>(reorder_it->get());
   CHECK_EQ(reorder_op->inputs.size(), 1);
@@ -104,7 +106,7 @@ TransposeOperator* CreateTransposeFromReorderAxes(
 
   // Get input array. If kFakeQuant is the input into ReorderAxes, get the input
   // array passed into kFakeQuant. kFakeQuant op is dropped when possible.
-  string constant_input_array_name = input_array_name;
+  std::string constant_input_array_name = input_array_name;
   if (!input_array.buffer) {
     const auto* op_producing_input = GetOpWithOutput(*model, input_array_name);
     if (op_producing_input &&
@@ -117,8 +119,8 @@ TransposeOperator* CreateTransposeFromReorderAxes(
   // been adjusted to reflect the permutations in ReorderAxes. ReorderAxes will
   // be merged into a constant array when possible.
   if (IsConstantParameterArray(*model, constant_input_array_name))
-    return ::tensorflow::Status::OK();
-  if (!output_array.has_shape()) return ::tensorflow::Status::OK();
+    return absl::OkStatus();
+  if (!output_array.has_shape()) return absl::OkStatus();
 
   const auto input_axes_order = reorder_op->input_axes_order;
   const auto output_axes_order = reorder_op->output_axes_order;
@@ -144,7 +146,7 @@ TransposeOperator* CreateTransposeFromReorderAxes(
   DeleteOpAndArrays(model, reorder_op);
 
   *modified = true;
-  return ::tensorflow::Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace toco

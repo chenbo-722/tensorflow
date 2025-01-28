@@ -21,7 +21,6 @@ limitations under the License.
 
 #include "absl/container/flat_hash_map.h"
 #include "tensorflow/core/graph/graph.h"
-#include "tensorflow/stream_executor/lib/statusor.h"
 
 namespace tensorflow {
 
@@ -35,7 +34,7 @@ extern const char kXlaInferredShapesAttrName[];
 // We have to perform shape inference before encapsulation because after
 // encapsulation, some nodes will be encapsulated into function call, and shape
 // inference does not handle function call at the moment.
-Status PerformStaticShapeInferenceBeforeEncapsulation(Graph* g);
+absl::Status PerformStaticShapeInferenceBeforeEncapsulation(Graph* g);
 
 // Attribute indicating that some ops in this node's XLA computation has control
 // dependency on this node. Attribute value will always be "true".
@@ -72,7 +71,7 @@ extern const char kXlaLiftedArgOutsideCompilationAttrName[];
 
 // Attribute indicating that this is an IdentityN node receiving inputs for a
 // outside compilation Placeholder node (the original outside compilation node
-// is moved out of TPU comutation, and we left a Placeholder node there).
+// is moved out of TPU computation, and we left a Placeholder node there).
 // Attribute value will be a string, which is the outside compilation cluster
 // name for the outside compilation Placeholder node.
 extern const char kXlaOutsideCompilationInputsAttrName[];
@@ -117,7 +116,7 @@ struct XlaClusterInfo {
 // dependencies and control dependencies. cluster_deps maps the name name of an
 // outside compilation cluster to a set of names of outside compilation clusters
 // that it depends on.
-stream_executor::port::StatusOr<
+absl::StatusOr<
     std::unique_ptr<absl::flat_hash_map<string, std::vector<string>>>>
 OutsideCompilationClusterDependencies(
     const Graph* g, const string& outside_compilation_attr_name);
@@ -135,7 +134,7 @@ OutsideCompilationClusterDependencies(
 //     outside compilation node.
 // 2.  For data edges between different outside compilations, remove the edge
 //     and create a Placeholder node as dst node's input.
-Status PreprocessEdgesBetweenOutsideCompilations(
+absl::Status PreprocessEdgesBetweenOutsideCompilations(
     Graph* g, const string& outside_compilation_attr_name);
 
 // Postprocesses edges within the same XLA cluster. This function reverts what
@@ -149,7 +148,7 @@ Status PreprocessEdgesBetweenOutsideCompilations(
 // Notice that control edges marked by
 // `PreprocessEdgesBetweenOutsideCompilations` step 1b are not handled here.
 // They are handled in `RewriteOutsideCompilationSubgraphFn`.
-Status PostprocessEdgesBetweenOutsideCompilations(
+absl::Status PostprocessEdgesBetweenOutsideCompilations(
     Graph* g, const string& outside_compilation_attr_name);
 }  // namespace tensorflow
 

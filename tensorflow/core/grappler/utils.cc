@@ -15,26 +15,42 @@ limitations under the License.
 
 #include "tensorflow/core/grappler/utils.h"
 
-#include <iterator>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
-#include <queue>
+#include <set>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
+#include "Eigen/Core"  // from @eigen_archive
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/function.h"
+#include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_def.pb.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/graph/tensor_id.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
-#include "tensorflow/core/lib/strings/numbers.h"
-#include "tensorflow/core/lib/strings/scanner.h"
-#include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/notification.h"
+#include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/platform/threadpool.h"
+#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/device_name_utils.h"
+#include "tsl/platform/errors.h"
 
 namespace tensorflow {
 namespace grappler {
@@ -72,91 +88,6 @@ bool IsShapeConsumer(const NodeDef& node) {
 
 }  // namespace
 
-NodeMap::NodeMap(GraphDef* graph) {
-  CHECK(graph != nullptr);
-  for (int i = 0; i < graph->node_size(); i++) {
-    NodeDef* node = graph->mutable_node(i);
-    const string& node_name = node->name();
-    auto rslt = nodes_.emplace(node_name, node);
-    // Check that the graph doesn't contain multiple nodes with the same name.
-    if (!rslt.second) {
-      LOG(WARNING) << "Duplicated node in the graph: " << node_name;
-    }
-    for (const auto& input : node->input()) {
-      outputs_[NodeName(input)].insert(nodes_[node_name]);
-    }
-  }
-}
-
-void NodeMap::RemoveNode(const string& name) {
-  nodes_.erase(NodeName(name));
-  outputs_.erase(NodeName(name));
-}
-
-NodeDef* NodeMap::GetNode(const string& name) const {
-  const string node_name = NodeName(name);
-  auto it = nodes_.find(node_name);
-  if (it == nodes_.end()) {
-    return nullptr;
-  }
-  return it->second;
-}
-
-bool NodeMap::NodeExists(const string& name) const {
-  const string node_name = NodeName(name);
-  return nodes_.find(node_name) != nodes_.end();
-}
-
-const std::set<NodeDef*>& NodeMap::GetOutputs(const string& node_name) const {
-  auto it = outputs_.find(node_name);
-  if (it == outputs_.end()) {
-    return empty_set_;
-  }
-  return it->second;
-}
-
-void NodeMap::AddNode(const string& node_name, NodeDef* node) {
-  auto ret = nodes_.emplace(node_name, CHECK_NOTNULL(node));
-  CHECK(ret.second) << "Pair (" << node_name << "," << node
-                    << ") is not inserted because the same key already exists.";
-}
-
-void NodeMap::AddOutput(const string& node_name, const string& output_name) {
-  auto output_node = nodes_[NodeName(output_name)];
-  CHECK(output_node) << "Output node " << output_name
-                     << " is missing in NodeMap.";
-  outputs_[node_name].insert(output_node);
-}
-
-void NodeMap::RemoveOutput(const string& node_name, const string& output_name) {
-  outputs_[node_name].erase(nodes_[NodeName(output_name)]);
-}
-
-void NodeMap::UpdateInput(const string& node_name, const string& old_input_name,
-                          const string& new_input_name) {
-  RemoveOutput(NodeName(old_input_name), node_name);
-  AddOutput(NodeName(new_input_name), node_name);
-}
-
-void NodeMap::RemoveInputs(const string& node_name) {
-  auto node = nodes_[node_name];
-  for (const auto& input : node->input()) {
-    RemoveOutput(NodeName(input), node->name());
-  }
-}
-
-void NodeMap::RemoveOutputs(const string& node_name) {
-  outputs_.erase(node_name);
-}
-
-void NodeMap::UpdateOutput(const string& node_name,
-                           const string& old_output_name,
-                           const string& new_output_name) {
-  std::set<NodeDef*>& outputs = outputs_[node_name];
-  outputs.erase(nodes_[NodeName(old_output_name)]);
-  outputs.insert(nodes_[NodeName(new_output_name)]);
-}
-
 string TensorIdToString(const TensorId& tensor_id) {
   return tensor_id.index() == 0 ? string(tensor_id.node())
                                 : tensor_id.ToString();
@@ -173,7 +104,7 @@ bool IsSameInput(const string& name1, const string& name2) {
   return tensor1 == tensor2;
 }
 
-bool IsControlInput(const string& name) {
+bool IsControlInput(absl::string_view name) {
   return !name.empty() && name[0] == '^';
 }
 
@@ -193,7 +124,7 @@ string AddPrefixToNodeName(const string& name, const string& prefix) {
   return AddPrefixToNodeName(name, prefix, "/");
 }
 
-bool ExecuteWithTimeout(std::function<void()> fn, const int64 timeout_in_ms,
+bool ExecuteWithTimeout(std::function<void()> fn, const int64_t timeout_in_ms,
                         thread::ThreadPool* const thread_pool) {
   if (timeout_in_ms <= 0) {
     fn();
@@ -258,28 +189,78 @@ int NumOutputs(const NodeDef& node, GraphDef* graph) {
 }
 
 bool HasControlInputs(const NodeDef& node) {
-  int num_inputs = node.input_size();
+  const int num_inputs = node.input_size();
   if (num_inputs > 0 && IsControlInput(node.input(num_inputs - 1))) {
     return true;
   }
   return false;
 }
 
+bool HasRegularInputs(const NodeDef& node) {
+  const int num_inputs = node.input_size();
+  if (num_inputs > 0 && !IsControlInput(node.input(0))) {
+    return true;
+  }
+  return false;
+}
+
 int NumNonControlInputs(const NodeDef& node) {
-  int num_inputs = node.input_size();
-  for (const string& input : node.input()) {
+  int num_inputs = 0;
+  for (; num_inputs < node.input_size(); ++num_inputs) {
+    const string& input = node.input(num_inputs);
     if (IsControlInput(input)) {
-      --num_inputs;
+      return num_inputs;
     }
   }
   return num_inputs;
 }
 
+int NumControlInputs(const NodeDef& node) {
+  int num_inputs = 0;
+  for (; num_inputs < node.input_size(); ++num_inputs) {
+    const string& input = node.input(node.input_size() - num_inputs - 1);
+    if (!IsControlInput(input)) {
+      return num_inputs;
+    }
+  }
+  return num_inputs;
+}
+
+bool HasRegularOutputs(const NodeDef& node, const NodeMap& node_map) {
+  for (const NodeDef* output : node_map.GetOutputs(node.name())) {
+    for (const string& node_as_input : output->input()) {
+      if (IsControlInput(node_as_input)) break;
+
+      TensorId tensor = ParseTensorName(node_as_input);
+      if (tensor.node() == node.name()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool HasControlOutputs(const NodeDef& node, const NodeMap& node_map) {
+  for (const NodeDef* output : node_map.GetOutputs(node.name())) {
+    for (int idx = output->input_size() - 1; idx >= 0; --idx) {
+      const string& node_as_input = output->input(idx);
+      if (!IsControlInput(node_as_input)) break;
+
+      TensorId tensor = ParseTensorName(node_as_input);
+      if (tensor.node() == node.name()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 int NumControlOutputs(const NodeDef& node, const NodeMap& node_map) {
   int num_outputs = 0;
   for (const NodeDef* output : node_map.GetOutputs(node.name())) {
-    for (const string& node_as_input : output->input()) {
-      if (!IsControlInput(node_as_input)) continue;
+    for (int idx = output->input_size() - 1; idx >= 0; --idx) {
+      const string& node_as_input = output->input(idx);
+      if (!IsControlInput(node_as_input)) break;
 
       TensorId tensor = ParseTensorName(node_as_input);
       if (tensor.node() == node.name()) {
@@ -371,7 +352,7 @@ void PermuteNodesInPlace(GraphDef* graph, std::vector<int>* permutation,
     }
     permutation->swap(inv_perm);
   }
-  for (std::size_t n = 0; n + 1 < permutation->size(); ++n) {
+  for (int n = 0, end = permutation->size(); n + 1 < end; ++n) {
     while (n != (*permutation)[n]) {
       std::size_t r = (*permutation)[n];
       graph->mutable_node()->SwapElements(n, r);
@@ -381,7 +362,7 @@ void PermuteNodesInPlace(GraphDef* graph, std::vector<int>* permutation,
 }
 
 void DedupControlInputs(NodeDef* node) {
-  std::unordered_set<string> inputs;
+  absl::flat_hash_set<string> inputs;
   int pos = 0;
   while (pos < node->input_size()) {
     const string& input = node->input(pos);
@@ -458,7 +439,7 @@ void EraseNodesFromGraph(const std::set<string>& nodes_to_delete,
     }                                                                        \
     break
 
-Status SetTensorValue(DataType dtype, int value, Tensor* tensor) {
+absl::Status SetTensorValue(DataType dtype, int value, Tensor* tensor) {
   // TODO(rmlarsen): Support more general shapes.
   // TODO(lyandy): Change `value` to be int64 once int64 -> qint32 is supported.
   if (tensor->NumElements() != 1) {
@@ -488,27 +469,28 @@ Status SetTensorValue(DataType dtype, int value, Tensor* tensor) {
       return errors::InvalidArgument("Unsupported type ",
                                      DataTypeString(dtype));
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 #undef HANDLE_CASE
 
-Status CheckAttrExists(const NodeDef& node, const string& key) {
+absl::Status CheckAttrExists(const NodeDef& node, const string& key) {
   if (!HasNodeAttr(node, key)) {
     return errors::InvalidArgument("Node '", node.name(), "' lacks '", key,
                                    "' attr: ", node.ShortDebugString());
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status CheckAttrsExist(const NodeDef& node, absl::Span<const string> keys) {
+absl::Status CheckAttrsExist(const NodeDef& node,
+                             absl::Span<const string> keys) {
   for (const string& key : keys) {
     TF_RETURN_IF_ERROR(CheckAttrExists(node, key));
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status IsKernelRegisteredForNode(
+absl::Status IsKernelRegisteredForNode(
     absl::string_view node_name, bool has_experimental_debug_info,
     const NodeDef_ExperimentalDebugInfo& experimental_debug_info,
     absl::string_view node_op, absl::string_view node_device,
@@ -523,11 +505,48 @@ Status IsKernelRegisteredForNode(
                        node_op, node_device, node_attrs, nullptr, nullptr);
 }
 
-Status IsKernelRegisteredForNode(const NodeDef& node) {
+absl::Status IsKernelRegisteredForNode(const NodeDef& node) {
   return IsKernelRegisteredForNode(node.name(),
                                    node.has_experimental_debug_info(),
                                    node.experimental_debug_info(), node.op(),
                                    node.device(), AttrSlice(&node.attr()));
+}
+
+namespace {
+void RemoveAttributes(const std::vector<absl::string_view>& to_remove,
+                      NodeDef* node) {
+  if (to_remove.size() == node->attr_size()) {
+    node->clear_attr();
+  } else {
+    for (const auto& key : to_remove) {
+      node->mutable_attr()->erase(string(key));
+    }
+  }
+}
+}  // namespace
+
+int EraseRegularNodeAttributes(NodeDef* node) {
+  std::vector<absl::string_view> to_remove;
+  for (const auto& attr : node->attr()) {
+    if (!attr.first.empty() && (attr.first)[0] != '_') {
+      to_remove.push_back(attr.first);
+    }
+  }
+  RemoveAttributes(to_remove, node);
+  return to_remove.size();
+}
+
+int EraseNodeOutputAttributes(NodeDef* node) {
+  std::vector<absl::string_view> to_remove;
+  for (const auto& attr : node->attr()) {
+    const string& attr_name = attr.first;
+    if (attr_name == "_xla_inferred_shapes" ||
+        absl::StartsWith(attr_name, "_output_")) {
+      to_remove.push_back(attr_name);
+    }
+  }
+  RemoveAttributes(to_remove, node);
+  return to_remove.size();
 }
 
 }  // end namespace grappler

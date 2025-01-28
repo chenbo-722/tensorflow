@@ -28,7 +28,7 @@ namespace grappler {
 // any) the given node can be running in. It's constructed from an immutable
 // GraphView, and any modification of the underlying graph might invalidate it.
 //
-// All execution frames assigned an unique integer id, but they do not have any
+// All execution frames assigned a unique integer id, but they do not have any
 // meaning whatsoever, it's just a sequence number.
 //
 // See the paper "Dynamic Control Flow in Large-Scale Machine Learning" for
@@ -39,13 +39,13 @@ class FrameView {
 
   // Infers nodes execution frames from the GraphView. Returns an error if
   // called multiple times.
-  Status InferFromGraphView(const utils::GraphView& graph_view);
+  absl::Status InferFromGraphView(const utils::GraphView& graph_view);
   // Infers nodes execution frames from the MutableGraphView. Returns an error
   // if called multiple times.
-  Status InferFromGraphView(const utils::MutableGraphView& graph_view);
+  absl::Status InferFromGraphView(const utils::MutableGraphView& graph_view);
   // Infers nodes execution by constructing temporary GraphView and passing it
   // to InferFromGraphView.
-  Status InferFromGraph(const GraphDef& graph);
+  absl::Status InferFromGraph(const GraphDef& graph);
 
   // Returns all frames of the given node (denoted by their frame ids) in
   // outermost-to-innermost order.
@@ -59,7 +59,7 @@ class FrameView {
 
  private:
   template <typename GraphViewT>
-  inline Status InferFromGraphViewT(const GraphViewT& graph_view);
+  inline absl::Status InferFromGraphViewT(const GraphViewT& graph_view);
 
   bool is_inferred_;  // true if it was inferred from the graph
   int num_frames_;    // number of frames present in a graph

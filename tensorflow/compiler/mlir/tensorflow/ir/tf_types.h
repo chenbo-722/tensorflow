@@ -18,190 +18,36 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_MLIR_TENSORFLOW_IR_TF_TYPES_H_
 #define TENSORFLOW_COMPILER_MLIR_TENSORFLOW_IR_TF_TYPES_H_
 
-#include "mlir/IR/Diagnostics.h"  // TF:local_config_mlir
-#include "mlir/IR/Location.h"  // TF:local_config_mlir
-#include "mlir/IR/StandardTypes.h"  // TF:local_config_mlir
-#include "mlir/IR/Types.h"  // TF:local_config_mlir
+#include "tensorflow/core/ir/types/dialect.h"
 
 namespace mlir {
 namespace TF {
 
-namespace TensorFlowTypes {
-// List of supported TensorFlowType kinds, necessary for isa/dyn_cast.
-enum Kind {
-  FIRST_USED_TENSORFLOW_TYPE = Type::FIRST_TENSORFLOW_TYPE,
-#define HANDLE_TF_TYPE(tftype, enumerant, name) enumerant,
-#include "tensorflow/compiler/mlir/tensorflow/ir/tf_types.def"
-  LAST_USED_TENSORFLOW_TYPE,
-};
-}  // namespace TensorFlowTypes
+// This all moved under tensorflow/core/ir/types and these using declaration are
+// to help with the transition.
 
-// The base class in the TensorFlow type hierarchy.
-class TensorFlowType : public Type {
- public:
-  using Type::Type;
+using ::mlir::tf_type::AreCastCompatible;          // NOLINT
+using ::mlir::tf_type::ArraysAreCastCompatible;    // NOLINT
+using ::mlir::tf_type::BroadcastCompatible;        // NOLINT
+using ::mlir::tf_type::DropRefType;                // NOLINT
+using ::mlir::tf_type::filter_resources;           // NOLINT
+using ::mlir::tf_type::GetCastCompatibleType;      // NOLINT
+using ::mlir::tf_type::HasCompatibleElementTypes;  // NOLINT
+using ::mlir::tf_type::IsValidTFTensorType;        // NOLINT
+using ::mlir::tf_type::OperandShapeIterator;       // NOLINT
+using ::mlir::tf_type::ResourceType;               // NOLINT
+using ::mlir::tf_type::ResultShapeIterator;        // NOLINT
+using ::mlir::tf_type::ResultShapeRange;           // NOLINT
+using ::mlir::tf_type::StringType;                 // NOLINT
+using ::mlir::tf_type::TensorFlowRefType;          // NOLINT
+using ::mlir::tf_type::TensorFlowType;             // NOLINT
+using ::mlir::tf_type::TensorFlowTypeWithSubtype;  // NOLINT
+using ::mlir::tf_type::VariantType;                // NOLINT
 
-  // Support method to enable LLVM-style type casting.
-  static bool classof(Type type) {
-    return type.getKind() >= Type::FIRST_TENSORFLOW_TYPE &&
-           type.getKind() <= TensorFlowTypes::LAST_USED_TENSORFLOW_TYPE;
-  }
-};
-
-// Returns true if the specified type is a valid TensorFlow element type.
-static inline bool IsValidTFElementType(Type type) {
-  return type.isa<FloatType>() || type.isa<IntegerType>() ||
-         type.isa<TensorFlowType>();
-}
-
-// Returns true if this is a valid TensorFlow tensor type.
-static inline bool IsValidTFTensorType(Type type) {
-  // TensorFlow types should be tensors of one of the valid TensorFlow element
-  // types.
-  if (auto tensor_ty = type.dyn_cast<TensorType>())
-    return IsValidTFElementType(tensor_ty.getElementType());
-  return false;
-}
-
-namespace detail {
-// Common implementation of TensorFlow types.  The template argument indicates
-// the concrete derived class per CRTP.  Concrete classes must implement the
-// following:
-//   - `static unsigned getTypeKind()` that returns the (fixed) kind of the
-//     type.
-template <typename Derived>
-class TensorFlowTypeImpl : public Type::TypeBase<Derived, TensorFlowType> {
- public:
-  using Base = typename Type::TypeBase<Derived, TensorFlowType>;
-  using TFBase = TensorFlowTypeImpl<Derived>;
-  using Base::Base;
-
-  // Get the unique'ed type in the given context.
-  static Derived get(MLIRContext* context) {
-    return Base::get(context, Derived::getTypeKind());
-  }
-
-  // Support method to enable LLVM-style type casting.
-  static bool kindof(unsigned kind) { return kind == Derived::getTypeKind(); }
-};
-}  // namespace detail
-
-// TensorFlowRefType class supports all the ref types in TensorFlow dialect.
-class TensorFlowRefType : public TensorFlowType {
- public:
-  using TensorFlowType::TensorFlowType;
-
-  // Checks if a type is TensorFlow Ref type.
-  static bool classof(Type type) {
-    return type.getKind() >= TensorFlowTypes::FLOAT_REF &&
-           type.getKind() <= TensorFlowTypes::LAST_USED_TENSORFLOW_TYPE;
-  }
-
-  // Converts a type to the corresponding TensorFlowRef type.
-  static TensorFlowType get(Type type);
-  static TensorFlowType getChecked(Type type, MLIRContext* context,
-                                   Location loc) {
-    if (failed(verifyConstructionInvariants(loc, context, type))) {
-      return TensorFlowRefType();
-    }
-    return get(type);
-  }
-
-  static LogicalResult verifyConstructionInvariants(
-      llvm::Optional<Location> loc, MLIRContext* context, Type type) {
-    // type should be a valid TensorFlow type.
-    if (!IsValidTFTensorType(type)) {
-      if (loc) {
-        emitError(*loc) << "invalid TensorFlow type: " << type;
-      }
-      return failure();
-    }
-    return success();
-  }
-
-  // Converts a TensorFlowRef type to the corresponding TensorFlow or standard
-  // type.
-  Type RemoveRef();
-};
-
-#define HANDLE_TF_TYPE(tftype, enumerant, name)                          \
-  class tftype##Type : public detail::TensorFlowTypeImpl<tftype##Type> { \
-   public:                                                               \
-    using TFBase::TFBase;                                                \
-    static unsigned getTypeKind() { return TensorFlowTypes::enumerant; } \
-  };
-
-// Custom TensorFlow types are defined separately.
-#define HANDLE_CUSTOM_TF_TYPE(tftype, enumerant, name)
-
-// NOLINTNEXTLINE
+#define HANDLE_TF_TYPE(tftype, enumerant, name) \
+  using tftype##Type = mlir::tf_type::tftype##Type;
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_types.def"
 
-// Storage type contains inferred subtypes for VariantType.
-class VariantTypeStorage : public TypeStorage {
- public:
-  using KeyTy = ArrayRef<TensorType>;
-
-  // NOLINTNEXTLINE
-  static VariantTypeStorage* construct(TypeStorageAllocator& allocator,
-                                       const KeyTy& key) {
-    ArrayRef<TensorType> subtypes = allocator.copyInto(key);
-    return new (allocator.allocate<VariantTypeStorage>())
-        VariantTypeStorage(subtypes);
-  }
-
-  explicit VariantTypeStorage(const KeyTy& key) : subtypes_(key) {}
-
-  bool operator==(const KeyTy& key) const { return key == subtypes_; }
-
-  static llvm::hash_code hashKey(const KeyTy& key) {
-    return llvm::hash_combine_range(key.begin(), key.end());
-  }
-
-  KeyTy subtypes_;
-};
-
-// TensorFlow variant type is used to support arbitrary custom C++ data types.
-// VariantType stores inferred shape and datatype for subtypes unlike most other
-// data types don't have any associated information. These subtypes are opaque
-// and their interpretation depends on the actual underlying type. For example,
-// variants encoding TensorList type stores the common shape and dtype of the
-// list elements as the only subtype.
-class VariantType
-    : public Type::TypeBase<VariantType, TensorFlowType, VariantTypeStorage> {
- public:
-  using Base::Base;
-
-  static VariantType get(ArrayRef<TensorType> subtypes, MLIRContext* context) {
-    return Base::get(context, TensorFlowTypes::VARIANT, subtypes);
-  }
-
-  static VariantType getChecked(ArrayRef<TensorType> subtypes,
-                                MLIRContext* context, Location loc) {
-    return Base::getChecked(loc, context, TensorFlowTypes::VARIANT, subtypes);
-  }
-
-  static VariantType get(MLIRContext* context) { return get({}, context); }
-
-  static bool kindof(unsigned kind) { return kind == TensorFlowTypes::VARIANT; }
-
-  static LogicalResult verifyConstructionInvariants(
-      llvm::Optional<Location> loc, MLIRContext* context,
-      ArrayRef<TensorType> subtypes) {
-    // Each of the subtypes should be a valid TensorFlow type.
-    for (TensorType subtype : subtypes) {
-      if (!IsValidTFTensorType(subtype)) {
-        if (loc) {
-          emitError(*loc) << "invalid VariantType subtype: " << subtype;
-        }
-        return failure();
-      }
-    }
-    return success();
-  }
-
-  ArrayRef<TensorType> getSubtypes() { return getImpl()->subtypes_; }
-};
 
 }  // end namespace TF
 }  // end namespace mlir

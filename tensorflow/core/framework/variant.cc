@@ -14,16 +14,14 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/framework/variant.h"
+
 #include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/framework/variant_encode_decode.h"
 #include "tensorflow/core/framework/variant_op_registry.h"
-#include "tensorflow/core/framework/variant_tensor_data.h"
-#include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/lib/gtl/map_util.h"
 
 namespace tensorflow {
 
-Variant::~Variant() { clear(); }
+Variant::~Variant() { ResetMemory(); }
 
 bool Variant::Decode(VariantTensorData data) {
   if (!is_empty()) {
@@ -75,7 +73,7 @@ bool DecodeVariant(string* buf, VariantTensorDataProto* value) {
   return value->ParseFromString(*buf);
 }
 
-void EncodeVariantList(const Variant* variant_array, int64 n,
+void EncodeVariantList(const Variant* variant_array, int64_t n,
                        std::unique_ptr<port::StringListEncoder> e) {
   for (int i = 0; i < n; ++i) {
     string s;
@@ -86,7 +84,7 @@ void EncodeVariantList(const Variant* variant_array, int64 n,
 }
 
 bool DecodeVariantList(std::unique_ptr<port::StringListDecoder> d,
-                       Variant* variant_array, int64 n) {
+                       Variant* variant_array, int64_t n) {
   std::vector<uint32> sizes(n);
   if (!d->ReadSizes(&sizes)) return false;
 

@@ -15,26 +15,22 @@
 # LINT.IfChange
 """TensorFlow root package"""
 
-from __future__ import absolute_import as _absolute_import
-from __future__ import division as _division
-from __future__ import print_function as _print_function
-
 import sys as _sys
 import importlib as _importlib
 import types as _types
 
 
 # Since TensorFlow Python code now resides in tensorflow_core but TensorFlow
-# ecosystem code (e.g. estimator, but also even tensorflow) imports tensorflow
-# we need to do forwarding between the two. To do so, we use a lazy loader to
-# load and forward the top level modules. We cannot use the LazyLoader defined
-# by tensorflow at tensorflow/python/util/lazy_loader.py as to use that we would
-# already need to import tensorflow. Hence, we define it inline.
+# ecosystem code imports tensorflow, we need to do forwarding between the two.
+# To do so, we use a lazy loader to load and forward the top level modules. We
+# cannot use the LazyLoader defined by tensorflow at
+# tensorflow/python/util/lazy_loader.py as to use that we would already need to
+# import tensorflow. Hence, we define it inline.
 class _LazyLoader(_types.ModuleType):
   """Lazily import a module so that we can forward it."""
 
   # The lint error here is incorrect.
-  def __init__(self, local_name, parent_module_globals, name):  # pylint: disable=super-on-old-class
+  def __init__(self, local_name, parent_module_globals, name):
     self._local_name = local_name
     self._parent_module_globals = parent_module_globals
     super(_LazyLoader, self).__init__(name)
@@ -53,6 +49,9 @@ class _LazyLoader(_types.ModuleType):
   def __dir__(self):
     module = self._load()
     return dir(module)
+
+  def __reduce__(self):
+    return __import__, (self.__name__,)
 
 
 # Forwarding a module is as simple as lazy loading the module from the new path
@@ -79,16 +78,6 @@ _top_level_modules = [
     "tensorflow.summary",  # tensorboard
     "tensorflow.examples",
 ]
-# Estimator needs to be handled separatedly so we can still allow both
-# import tensorflow_estimator and import tensorflow.estimator work
-# Only in the second case do we actually need to do forwarding, the first case
-# already defines most of the hierarchy and eagerly forwarding would result in
-# an import loop.
-if "tensorflow_estimator" not in _sys.modules:
-  _root_estimator = False
-  _top_level_modules.append("tensorflow.estimator")
-else:
-  _root_estimator = True
 
 # Lazy load all of the _top_level_modules, we don't need their names anymore
 for _m in _top_level_modules:
@@ -96,6 +85,8 @@ for _m in _top_level_modules:
 
 # We still need all the names that are toplevel on tensorflow_core
 from tensorflow_core import *
+
+_major_api_version = 2
 
 # These should not be visible in the main tf module.
 try:
@@ -121,16 +112,6 @@ except NameError:
 try:
   del examples
 except NameError:
-  pass
-
-# TODO(mihaimaruseac): Revisit all of this once we release 2.1
-# Manually patch keras and estimator so tf.keras and tf.estimator work
-keras = _sys.modules["tensorflow.keras"]
-if not _root_estimator: estimator = _sys.modules["tensorflow.estimator"]
-# Also import module aliases
-try:
-  from tensorflow_core import losses, metrics, initializers, optimizers
-except ImportError:
   pass
 
 # LINT.ThenChange(//tensorflow/virtual_root_template_v1.__init__.py.oss)

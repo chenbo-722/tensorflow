@@ -18,10 +18,11 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/lite/toco/graph_transformations/graph_transformations.h"
 #include "tensorflow/lite/toco/model.h"
 #include "tensorflow/lite/toco/tooling_util.h"
-#include "tensorflow/core/platform/logging.h"
 
 namespace toco {
 
@@ -72,25 +73,25 @@ bool IsMoveOperator(OperatorType optype) {
   const auto element_op_it = model->operators.begin() + op_index;
   std::unique_ptr<Operator>& element_op = *element_op_it;
   if (!IsElementwiseOperator(element_op->type)) {
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
-  const string intermediate_name = element_op->inputs[0];
+  const std::string intermediate_name = element_op->inputs[0];
   auto it = FindOpWithOutput(*model, intermediate_name);
   if (it == model->operators.end()) {
     AddMessageF("No preceding operator");
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   std::unique_ptr<Operator>& move_op = *it;
   if (!IsMoveOperator(move_op->type)) {
     AddMessageF("Preceding operator is not a move operator");
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   if (CountOpsWithInput(*model, intermediate_name) != 1) {
     AddMessageF("Input %s used elsewhere", intermediate_name);
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   // Check that the intermediate is discardable.
@@ -99,12 +100,12 @@ bool IsMoveOperator(OperatorType optype) {
         "Cannot swap elementwise as it would invalidate %s which is "
         "an output array.",
         intermediate_name);
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   // op->inputs may change so we need to keep a value by copy.
-  const string input_name = move_op->inputs[0];
-  const string output_name = element_op->outputs[0];
+  const std::string input_name = move_op->inputs[0];
+  const std::string output_name = element_op->outputs[0];
 
   AddMessageF("Swapping around operators with %s and %s", LogName(*element_op),
               LogName(*move_op));
@@ -127,9 +128,9 @@ bool IsMoveOperator(OperatorType optype) {
     move_op->outputs[0] = output_name;
   } else {
     // The intermediate array is now the output array.
-    for (int i = 0; i < model->operators.size(); i++) {
+    for (size_t i = 0; i < model->operators.size(); i++) {
       Operator* consumer = model->operators[i].get();
-      for (int j = 0; j < consumer->inputs.size(); j++) {
+      for (size_t j = 0; j < consumer->inputs.size(); j++) {
         if (consumer->inputs[j] == output_name) {
           consumer->inputs[j] = intermediate_name;
         }
@@ -153,7 +154,7 @@ bool IsMoveOperator(OperatorType optype) {
   element_op.swap(move_op);
 
   *modified = true;
-  return ::tensorflow::Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace toco

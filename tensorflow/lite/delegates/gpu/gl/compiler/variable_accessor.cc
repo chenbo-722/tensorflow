@@ -15,11 +15,18 @@ limitations under the License.
 
 #include "tensorflow/lite/delegates/gpu/gl/compiler/variable_accessor.h"
 
+#include <string>
+#include <utility>
+#include <variant>
+
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/variant.h"
 #include "tensorflow/lite/delegates/gpu/common/types.h"
+#include "tensorflow/lite/delegates/gpu/gl/compiler/preprocessor.h"
+#include "tensorflow/lite/delegates/gpu/gl/variable.h"
 
 namespace tflite {
 namespace gpu {
@@ -70,7 +77,22 @@ struct VariableTypeGetter {
 
 // Returns GLSL uniform type of the given variable.
 std::string GetVariableType(const Variable::ValueType& value) {
-  return absl::visit(VariableTypeGetter(), value);
+  return std::visit(VariableTypeGetter(), value);
+}
+
+struct LengthGetter {
+  template <typename T>
+  int operator()(const T& param) const {
+    return 1;
+  }
+  template <typename T>
+  int operator()(const std::vector<T>& param) const {
+    return param.size();
+  }
+};
+
+int GetLength(const Variable::ValueType& value) {
+  return std::visit(LengthGetter(), value);
 }
 
 template <typename T>
@@ -140,20 +162,29 @@ struct ConstGenerator {
 
 // Appends string representation of a variable value.
 void GetValue(const Variable::ValueType& value, std::string* result) {
-  absl::visit(ConstGenerator{result}, value);
+  std::visit(ConstGenerator{result}, value);
 }
 
 struct SharedVariableDeclarationGenerator {
   template <typename T>
   void operator()(const T&) const {
-    absl::StrAppend(result, "shared ", GetVariableType(variable.value), " ",
-                    variable.name, ";\n");
+    absl::StrAppend(result, "shared highp ", GetVariableType(variable.value),
+                    " ", variable.name, ";\n");
   }
 
   template <typename T>
   void operator()(const std::vector<T>& v) const {
-    absl::StrAppend(result, "shared ", GetVariableType(variable.value), " ",
-                    variable.name, "[", v.size(), "];\n");
+    absl::StrAppend(result, "shared highp ", GetVariableType(variable.value),
+                    " ", variable.name);
+    if (v.empty()) {
+      // Normalize the size of the shared array to that of the WorkGroupSize
+      absl::StrAppend(
+          result,
+          "[gl_WorkGroupSize.z * gl_WorkGroupSize.y * gl_WorkGroupSize.x];\n");
+    } else {
+      // Use the specified size
+      absl::StrAppend(result, "[", v.size(), "];\n");
+    }
   }
 
   const Variable& variable;
@@ -162,8 +193,8 @@ struct SharedVariableDeclarationGenerator {
 
 void GenerateSharedVariableDeclaration(const Variable& variable,
                                        std::string* result) {
-  absl::visit(SharedVariableDeclarationGenerator{variable, result},
-              variable.value);
+  std::visit(SharedVariableDeclarationGenerator{variable, result},
+             variable.value);
 }
 
 struct UniformParameterDeclarationGenerator {
@@ -185,8 +216,29 @@ struct UniformParameterDeclarationGenerator {
 
 void GenerateUniformParameterDeclaration(const Variable& variable,
                                          std::string* result) {
-  absl::visit(UniformParameterDeclarationGenerator{variable, result},
-              variable.value);
+  std::visit(UniformParameterDeclarationGenerator{variable, result},
+             variable.value);
+}
+
+struct VulkanPushConstantGenerator {
+  template <typename T>
+  void operator()(const T&) const {
+    absl::StrAppend(result, "  ", GetVariableType(variable.value), " ",
+                    variable.name, ";\n");
+  }
+
+  template <typename T>
+  void operator()(const std::vector<T>& v) const {
+    absl::StrAppend(result, "  ", GetVariableType(variable.value), " ",
+                    variable.name, "[", v.size(), "];\n");
+  }
+
+  const Variable& variable;
+  std::string* result;
+};
+
+void GenerateVulkanPushConstant(const Variable& variable, std::string* result) {
+  std::visit(VulkanPushConstantGenerator{variable, result}, variable.value);
 }
 
 struct VariableLengthGetter {
@@ -200,9 +252,72 @@ struct VariableLengthGetter {
   }
 };
 
+struct VulkanConstantGenerator {
+  template <typename T>
+  void operator()(const T&) const {
+    const std::string variable_type = GetVariableType(variable.value);
+
+    // Vulkan specialization constants are used for scalar types, all other
+    // types go in push (uniform) constants.
+    if (variable_type == "int" || variable_type == "uint" ||
+        variable_type == "float") {
+      absl::StrAppend(result, "layout(constant_id = ", *constant_id, ") const ",
+                      variable_type, " ", variable.name, " = ");
+      // Always set the default values to zero to generate generic cacheable
+      // shaders.
+      absl::StrAppend(result, (variable_type == "float" ? "0.0" : "0"), ";\n");
+      (*constant_id)++;
+    } else {
+      non_scalar_variables->push_back(variable);
+    }
+  }
+
+  template <typename T>
+  void operator()(const std::vector<T>& v) const {
+    non_scalar_variables->push_back(variable);
+  }
+
+  const Variable& variable;
+  int* const constant_id;
+  std::vector<Variable>* non_scalar_variables;
+  std::string* result;
+};
+
+void GenerateVulkanConstant(const Variable& variable, int* constant_id,
+                            std::vector<Variable>* non_scalar_variables,
+                            std::string* result) {
+  std::visit(VulkanConstantGenerator{variable, constant_id,
+                                     non_scalar_variables, result},
+             variable.value);
+}
+
+class VulkanConstantsProcessor {
+ public:
+  void ProcessVulkanConstant(const Variable& variable, std::string* result) {
+    GenerateVulkanConstant(variable, &constant_id_, &non_scalar_variables_,
+                           result);
+  }
+
+  void GeneratePushConstantsDeclarations(std::string* result) {
+    if (!non_scalar_variables_.empty()) {
+      *result += "\nlayout(push_constant) uniform pushConstants {\n";
+      for (const auto& variable : non_scalar_variables_) {
+        GenerateVulkanPushConstant(variable, result);
+      }
+      *result += "};\n";
+    }
+  }
+
+ protected:
+  // Reserve the first three specialization constants slots for the
+  // workgroup size.
+  int constant_id_ = 3;
+  std::vector<Variable> non_scalar_variables_;
+};
+
 // Returns true if value is a vector
 bool IsVariableLength(const Variable::ValueType& value) {
-  return absl::visit(VariableLengthGetter(), value);
+  return std::visit(VariableLengthGetter(), value);
 }
 
 enum Field : uint8_t { UNKNOWN = 4, X = 0, Y = 1, Z = 2, W = 3 };
@@ -249,7 +364,7 @@ struct FieldAccessor {
 // Appends formatted value of the given field.
 void GetValue(const Variable::ValueType& value, Field field,
               std::string* result) {
-  absl::visit(FieldAccessor{field, result}, value);
+  std::visit(FieldAccessor{field, result}, value);
 }
 
 struct FieldChecker {
@@ -288,7 +403,7 @@ struct FieldChecker {
 
 // Returns true if field has field access and field is not out of bounds.
 bool HasField(const Variable::ValueType& value, Field field) {
-  return absl::visit(FieldChecker{field}, value);
+  return std::visit(FieldChecker{field}, value);
 }
 
 void AssembleAccessor(absl::string_view name, absl::string_view index,
@@ -366,6 +481,11 @@ bool VariableAccessor::AddUniformParameter(Variable&& variable) {
   return true;
 }
 
+bool VariableAccessor::IsEmptyVariableLength(const Variable& variable) const {
+  const auto& value = variable.value;
+  return IsVariableLength(value) && GetLength(value) == 0;
+}
+
 std::string VariableAccessor::GetConstDeclarations() const {
   // Variable length variables are declared as const and accessed via variable
   // with index.
@@ -400,9 +520,18 @@ std::string VariableAccessor::GetSharedVariableDeclarations() const {
 std::string VariableAccessor::GetUniformParameterDeclarations() const {
   std::string declarations;
   if (!inline_values_) {
-    for (const auto& name : uniform_parameters_) {
-      const auto& variable = name_to_variable_.at(name);
-      GenerateUniformParameterDeclaration(variable, &declarations);
+    if (vulkan_support_) {
+      VulkanConstantsProcessor processor;
+      for (const auto& name : uniform_parameters_) {
+        const auto& variable = name_to_variable_.at(name);
+        processor.ProcessVulkanConstant(variable, &declarations);
+      }
+      processor.GeneratePushConstantsDeclarations(&declarations);
+    } else {
+      for (const auto& name : uniform_parameters_) {
+        const auto& variable = name_to_variable_.at(name);
+        GenerateUniformParameterDeclaration(variable, &declarations);
+      }
     }
   }
   return declarations;
@@ -412,8 +541,10 @@ std::vector<Variable> VariableAccessor::GetUniformParameters() const {
   std::vector<Variable> variables;
   if (!inline_values_) {
     variables.reserve(name_to_variable_.size());
-    for (const auto& variable : name_to_variable_) {
-      variables.push_back(variable.second);
+    // Keep the order of the variables consistent with that of the declarations
+    for (const auto& name : uniform_parameters_) {
+      const auto& variable = name_to_variable_.at(name);
+      variables.push_back(variable);
     }
   }
   return variables;

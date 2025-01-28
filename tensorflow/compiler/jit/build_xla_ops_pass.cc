@@ -32,15 +32,16 @@ limitations under the License.
 #include "tensorflow/compiler/jit/xla_cluster_util.h"
 #include "tensorflow/compiler/tf2xla/cc/ops/xla_jit_ops.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/status_macros.h"
+#include "xla/status_macros.h"
 #include "tensorflow/core/common_runtime/function.h"
+#include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/common_runtime/optimization_registry.h"
 #include "tensorflow/core/framework/graph_def_util.h"
+#include "tensorflow/core/framework/memory_types.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/graph/graph.h"
-#include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/public/version.h"
@@ -75,8 +76,30 @@ void MoveOutgoingEdges(Graph* g, Node* old_node, Node* new_node) {
 
 // Returns a data value that is dead iff `control` is dead.
 Output ControlToData(const Scope& scope, Node* control) {
+  // The choice of data type here is important.
+  //
+  // We implement a "control merge", which is a control edge that is alive if
+  // either of two nodes (denoted as A and B below) are alive, in the following
+  // manner:
+  //
+  //   A --ctrl--> Const0 --data--> Merge --data--> Identity
+  //                                 ^                 |
+  //                                 |                ctrl
+  //   B --ctrl--> Const1 --data-----+                 |
+  //                                                   v
+  //                                                  ***
+  //
+  // where *** denotes the merged control output.
+  //
+  // We want everything starting from Const{0/1} to Identity to either wholly
+  // live on the host or wholly live on device so we need to pick a data type
+  // that is either consistently assigned to the device (e.g. float) or
+  // consistently assigned to the host (e.g. int32).  We should *not* pick a
+  // data type that partly placed on the host and partly on the device
+  // (e.g. bool constants are placed on the device but bool Identity is placed
+  // on the host).
   Output data = ops::Const(scope.WithOpName("ctrl_as_data"),
-                           Tensor(DT_BOOL, TensorShape({0})));
+                           Tensor(DT_INT32, TensorShape({0})));
   scope.graph()->AddControlEdge(control, data.node());
   return Output(data.node());
 }
@@ -134,9 +157,9 @@ void MergeOutgoingDataEdges(const Scope& s, Node* old_node, Node* new_node,
         new_output = check_numerics_op;
       }
 
-      ops::Merge merge_op(s.WithOpName("merge_oidx_", oidx),
-                          {Output(old_node, oidx), new_output});
-      merged_output = merged_outputs[oidx] = merge_op.output;
+      ops::_XlaMerge xla_merge_op(s.WithOpName("merge_oidx_", oidx),
+                                  Output(old_node, oidx), new_output);
+      merged_output = merged_outputs[oidx] = xla_merge_op.output;
     }
 
     Node* dst = e->dst();
@@ -202,7 +225,7 @@ Output IncomingEdgeAsOutput(const Edge* e) {
   return Output(e->src(), e->src_output());
 }
 
-Status GetXlaClusterInfo(Node* n, XlaClusterInfo* result) {
+absl::Status GetXlaClusterInfo(Node* n, XlaClusterInfo* result) {
   int num_constant_inputs, num_resource_inputs;
   TF_RETURN_IF_ERROR(
       GetNodeAttr(n->attrs(), kXlaNumConstantArgsAttr, &num_constant_inputs));
@@ -237,17 +260,17 @@ Status GetXlaClusterInfo(Node* n, XlaClusterInfo* result) {
 
   result->function.set_name(n->type_string());
   *result->function.mutable_attr() = n->def().attr();
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status CopyIncomingControlEdges(Graph* g, Node* from, Node* to) {
+absl::Status CopyIncomingControlEdges(Graph* g, Node* from, Node* to) {
   for (const Edge* e : from->in_edges()) {
     if (e->IsControlEdge()) {
       g->AddControlEdge(e->src(), to);
     }
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 void RemoveAllIncomingControlEdges(Graph* g, Node* n) {
@@ -260,17 +283,18 @@ void RemoveAllIncomingControlEdges(Graph* g, Node* n) {
 }
 
 // Returns true (into `result`) if a node placed on `device` must be compiled.
-Status DeviceRequiresCompilation(const jit::DeviceInfoCache& device_info_cache,
-                                 jit::DeviceId device, bool* result) {
+absl::Status DeviceRequiresCompilation(
+    const jit::DeviceInfoCache& device_info_cache, jit::DeviceId device,
+    bool* result) {
   const XlaOpRegistry::DeviceRegistration* registration =
       device_info_cache.GetCompilationDevice(device);
   *result = registration->autoclustering_policy ==
             XlaOpRegistry::AutoclusteringPolicy::kAlways;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Replaces `n` with a `PartitionedCall` op that calls the same function.
-Status ReplaceFunctionCallWithPartitionedCall(
+absl::StatusOr<Node*> ReplaceFunctionCallWithPartitionedCall(
     const GraphOptimizationPassOptions& options,
     const FunctionLibraryDefinition& flib_def, Node* n, Graph* g,
     const NameAttrList& func, const Scope& root) {
@@ -286,9 +310,13 @@ Status ReplaceFunctionCallWithPartitionedCall(
     }
   }
 
-  ops::PartitionedCall call(
-      root.WithOpName("partitioned_call"), args, n->output_types(), func,
-      ops::PartitionedCall::Attrs{}.ConfigProto(config_string));
+  // In theory we can use PartitionedCall if the XLA cluster does not have any
+  // stateful operations.  However, for now we choose to be conservative since
+  // we don't have any evidence that choosing a stateless partitioned call helps
+  // for performance.
+  ops::StatefulPartitionedCall call(
+      root.WithOpName("stateful_partitioned_call"), args, n->output_types(),
+      func, ops::StatefulPartitionedCall::Attrs{}.ConfigProto(config_string));
 
   for (const Edge* e : n->in_edges()) {
     if (e->IsControlEdge()) {
@@ -313,10 +341,10 @@ Status ReplaceFunctionCallWithPartitionedCall(
   }
 
   g->RemoveNode(n);
-  return Status::OK();
+  return call.operation.node();
 }
 
-xla::StatusOr<jit::DeviceId> InferDeviceForCluster(
+absl::StatusOr<jit::DeviceId> InferDeviceForCluster(
     jit::DeviceInfoCache* device_info_cache, Node* n,
     const string& function_name, const FunctionLibraryDefinition& flib_def) {
   const FunctionDef* func_def = flib_def.Find(function_name);
@@ -374,7 +402,70 @@ std::vector<Output> GetXlaRunArgs(const Scope& s,
   return xla_run_args;
 }
 
-Status ReplaceNodeWithXlaCompileAndXlaRun(
+absl::StatusOr<MemoryTypeVector> GetOutputMemoryTypes(const Scope& root,
+                                                      Node* n) {
+  MemoryTypeVector input_mtypes, output_mtypes;
+  DeviceType device_type("");
+  TF_RETURN_IF_ERROR(
+      DeviceNameToDeviceType(n->assigned_device_name(), &device_type));
+  TF_RETURN_IF_ERROR(MemoryTypesForNode(root.graph()->op_registry(),
+                                        device_type, n->def(), &input_mtypes,
+                                        &output_mtypes));
+  return output_mtypes;
+}
+
+// Predicate INT32 typed inputs to `n` on the deadness of
+// `predicate_as_control`.
+//
+// This is a performance optimization.  Since INT32 arguments to a
+// PartitionedCall are placed on the host, a producer that produces them on the
+// device will incur a D2H copy, even if the PartitionedCall is not executed
+// (i.e. even if we choose to execute the XLA compiled computation via _XlaRun).
+// To prevent this, we add control dependencies to make the int32 input edges
+// into the PartitionedCall dead.  With this change the D2H copy only happens if
+// the PartitionedCall is actually executed.
+absl::Status PredicateInt32Inputs(const Scope& root, Node* n,
+                                  Operation predicate_as_control) {
+  std::vector<Output> int32_inputs;
+  std::vector<int> int32_inputs_input_idxs;
+  for (const Edge* e : n->in_edges()) {
+    if (e->IsControlEdge()) {
+      continue;
+    }
+
+    if (e->src()->output_type(e->src_output()) == DT_INT32) {
+      TF_ASSIGN_OR_RETURN(MemoryTypeVector source_output_mem_types,
+                          GetOutputMemoryTypes(root, e->src()));
+      if (source_output_mem_types[e->src_output()] == DEVICE_MEMORY) {
+        int32_inputs.push_back(Output(e->src(), e->src_output()));
+        int32_inputs_input_idxs.push_back(e->dst_input());
+      }
+    }
+  }
+
+  if (int32_inputs.empty()) {
+    return absl::OkStatus();
+  }
+
+  // Create a single IdentityN that is dead if and only if
+  // `predicate_as_control` is dead.
+  //
+  // IdentityN is also special in that, unlike `Identity`, it does not place
+  // int32 inputs in host memory.  Placing int32 inputs in host memory would
+  // defeat the purpose of adding this indirection.
+  ops::IdentityN identity_n(root.WithOpName("int32_id_n"), int32_inputs);
+  root.graph()->AddControlEdge(predicate_as_control.node(),
+                               identity_n.operation.node());
+
+  for (int i = 0, end = int32_inputs.size(); i < end; i++) {
+    TF_RETURN_IF_ERROR(root.graph()->UpdateEdge(identity_n[i].node(), i, n,
+                                                int32_inputs_input_idxs[i]));
+  }
+
+  return absl::OkStatus();
+}
+
+absl::Status ReplaceNodeWithXlaCompileAndXlaRun(
     jit::DeviceInfoCache* device_info_cache,
     const GraphOptimizationPassOptions& options,
     const FunctionLibraryDefinition& flib_def, bool lazy_compilation_enabled,
@@ -396,7 +487,7 @@ Status ReplaceNodeWithXlaCompileAndXlaRun(
 
   string device_name_str = string(device_info_cache->GetNameFor(device));
 
-  Status status;
+  absl::Status status;
   Scope root = NewInternalScope(g, &status, /*refiner=*/nullptr)
                    .NewSubScope(n->name())
                    .WithDevice(n->requested_device())
@@ -408,6 +499,11 @@ Status ReplaceNodeWithXlaCompileAndXlaRun(
                                /*resources=*/cluster_info.resource_inputs,
                                /*must_compile=*/requires_compilation,
                                cluster_info.function);
+
+  bool has_ref_attr;
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(n->attrs(), kXlaHasReferenceVarsAttr, &has_ref_attr));
+  xla_compile.operation.node()->AddAttr(kXlaHasReferenceVarsAttr, has_ref_attr);
   TF_RETURN_IF_ERROR(
       CopyIncomingControlEdges(g, /*from=*/n, /*to=*/xla_compile.key.node()));
 
@@ -457,19 +553,24 @@ Status ReplaceNodeWithXlaCompileAndXlaRun(
     // original node we set out to rewrite.  We just wire in the correct control
     // deps and we're done.
     RemoveAllIncomingControlEdges(g, n);
-    g->AddControlEdge(
-        DataToControl(root, inverse_predicated_compilation_key).node(), n);
+    Operation inverse_predicate_as_control =
+        DataToControl(root, inverse_predicated_compilation_key);
+    g->AddControlEdge(inverse_predicate_as_control.node(), n);
     n->ClearAttr(kXlaCompiledKernelAttr);
 
-    TF_RETURN_IF_ERROR(ReplaceFunctionCallWithPartitionedCall(
-        options, flib_def, n, g, cluster_info.function, root));
+    TF_ASSIGN_OR_RETURN(Node* const pco, ReplaceFunctionCallWithPartitionedCall(
+                                             options, flib_def, n, g,
+                                             cluster_info.function, root));
+
+    TF_RETURN_IF_ERROR(
+        PredicateInt32Inputs(root, pco, inverse_predicate_as_control));
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 }  // namespace
 
-Status BuildXlaOpsPass::Run(const GraphOptimizationPassOptions& options) {
+absl::Status BuildXlaOpsPass::Run(const GraphOptimizationPassOptions& options) {
   Graph* graph = options.graph->get();
 
   // Copy out the nodes we want to rewrite to avoid modifying the graph while we
@@ -515,6 +616,6 @@ Status BuildXlaOpsPass::Run(const GraphOptimizationPassOptions& options) {
     DumpGraphToFile("build_xla_ops", *graph, options.flib_def);
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 }  // namespace tensorflow

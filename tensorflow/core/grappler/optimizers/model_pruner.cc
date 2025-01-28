@@ -29,9 +29,11 @@ limitations under the License.
 #include "tensorflow/core/grappler/mutable_graph_view.h"
 #include "tensorflow/core/grappler/op_types.h"
 #include "tensorflow/core/grappler/utils.h"
+#include "tensorflow/core/grappler/utils/transitive_fanin.h"
 
 namespace tensorflow {
 namespace grappler {
+namespace {
 
 bool IsTrivialIdentity(const NodeDef& node, const GraphView& graph_view) {
   for (const auto input :
@@ -88,7 +90,7 @@ bool RemovalIncreasesEdgeCount(const NodeDef& node,
 bool IsOutputPortRefValue(const NodeDef& node, int port_id,
                           const OpRegistryInterface& op_registry) {
   const OpRegistrationData* op_reg_data = nullptr;
-  Status s = op_registry.LookUp(node.op(), &op_reg_data);
+  absl::Status s = op_registry.LookUp(node.op(), &op_reg_data);
   if (s.ok()) {
     DataType output_type;
     s = OutputTypeForNode(node, op_reg_data->op_def, port_id, &output_type);
@@ -102,7 +104,9 @@ bool IsOutputPortRefValue(const NodeDef& node, int port_id,
 bool CanRemoveNode(const NodeDef& node, const GraphView& graph_view,
                    const absl::flat_hash_set<string>& function_names,
                    const OpRegistryInterface& op_registry) {
-  if (IsNoOp(node) && node.input().empty()) {
+  if (IsNoOp(node) &&
+      (node.input().empty() ||
+       graph_view.NumFanouts(node, /*include_controlled_nodes=*/true) == 0)) {
     return true;
   }
   if (IsConstant(node) && node.input().empty() &&
@@ -206,12 +210,12 @@ absl::flat_hash_map<string, absl::flat_hash_set<int>> IdentityNTerminalPorts(
   // get pruned later on.
   absl::flat_hash_set<string> visited(terminal_nodes.begin(),
                                       terminal_nodes.end());
-  for (string terminal_node : terminal_nodes) {
+  for (const string& terminal_node : terminal_nodes) {
     NodeDef* node = node_map.GetNode(terminal_node);
     if (node == nullptr) {
       continue;
     }
-    for (string input : node->input()) {
+    for (const string& input : node->input()) {
       to_visit.push_back(input);
     }
   }
@@ -278,11 +282,11 @@ string NewIdentityFromIdentityN(int pos, const NodeDef& identity_n,
     return "";
   }
   NodeDef* new_node = graph->add_node();
-  Status status = NodeDefBuilder(new_node_name, "Identity")
-                      .Input(identity_n.input(pos), 0,
-                             identity_n.attr().at("T").list().type(pos))
-                      .Device(identity_n.device())
-                      .Finalize(new_node);
+  absl::Status status = NodeDefBuilder(new_node_name, "Identity")
+                            .Input(identity_n.input(pos), 0,
+                                   identity_n.attr().at("T").list().type(pos))
+                            .Device(identity_n.device())
+                            .Finalize(new_node);
   if (!status.ok()) {
     return "";
   }
@@ -291,14 +295,14 @@ string NewIdentityFromIdentityN(int pos, const NodeDef& identity_n,
   return new_node->name();
 }
 
-Status RewriteIdentityNAndInputsOutputs(
+absl::Status RewriteIdentityNAndInputsOutputs(
     NodeDef* node, int num_non_control_inputs,
     const absl::flat_hash_set<int>& terminal_ports, GraphDef* graph,
     NodeMap* node_map) {
   // Rewrite IdentityN node and associated inputs and outputs. For inputs and
   // outputs that don't lead to a terminal node, a new Identity node is created
   // and those inputs and outputs are rewritten to use the new Identity node as
-  // their outputs and inputs respectively. For the remaining nodes, the ouputs
+  // their outputs and inputs respectively. For the remaining nodes, the outputs
   // have their inputs updated with the adjusted port, from the IdentityN node
   // having less inputs.
   struct NodeOutputUpdate {
@@ -352,7 +356,7 @@ Status RewriteIdentityNAndInputsOutputs(
     }
   }
 
-  for (NodeOutputUpdate update : updates) {
+  for (const NodeOutputUpdate& update : updates) {
     node_map->AddOutput(update.input, update.output);
   }
 
@@ -377,12 +381,12 @@ Status RewriteIdentityNAndInputsOutputs(
   }
   mutable_inputs->DeleteSubrange(curr_pos, num_inputs - curr_pos);
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status SplitIdentityNInputs(GraphDef* graph,
-                            const std::vector<string>& terminal_nodes,
-                            bool* updated_graph) {
+absl::Status SplitIdentityNInputs(GraphDef* graph,
+                                  const std::vector<string>& terminal_nodes,
+                                  bool* updated_graph) {
   // For inputs of IdentityN nodes that do not lead to a terminal node, remove
   // them from IdentityN and create new individual Identity nodes. This will
   // allow ModelPruner to possibly remove nodes in the transitive fanin of the
@@ -397,9 +401,10 @@ Status SplitIdentityNInputs(GraphDef* graph,
     }
 
     const int num_non_control_inputs = NumNonControlInputs(*node);
+    const int terminal_second_size = terminal.second.size();
     if (node->attr().count("T") == 0 ||
         node->attr().at("T").list().type_size() != num_non_control_inputs ||
-        terminal.second.size() >= num_non_control_inputs) {
+        terminal_second_size >= num_non_control_inputs) {
       continue;
     }
 
@@ -408,34 +413,13 @@ Status SplitIdentityNInputs(GraphDef* graph,
     *updated_graph = true;
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status SetTransitiveFaninGraph(const GraphDef& input_graph,
-                               GraphDef* output_graph,
-                               const std::vector<string>& terminal_nodes) {
-  // Determines transitive fanin nodes from terminal nodes and add them to the
-  // output graph.
-  bool ill_formed = false;
-  std::vector<const NodeDef*> keep =
-      ComputeTransitiveFanin(input_graph, terminal_nodes, &ill_formed);
-  if (ill_formed) {
-    // Some graph edges are invalid, or some of the feeds/fetch don't exist:
-    // let's be conservative and preserve the graph as is.
-    return errors::InvalidArgument("Invalid input graph.");
-  }
-  // Try to keep the nodes ordered somewhat topologically since this helps
-  // further optimizations perform better.
-  output_graph->mutable_node()->Reserve(keep.size());
-  for (int i = keep.size() - 1; i >= 0; --i) {
-    *output_graph->add_node() = *keep[i];
-  }
+}  // namespace
 
-  return Status::OK();
-}
-
-Status ModelPruner::Optimize(Cluster* cluster, const GrapplerItem& item,
-                             GraphDef* optimized_graph) {
+absl::Status ModelPruner::Optimize(Cluster* cluster, const GrapplerItem& item,
+                                   GraphDef* optimized_graph) {
   const std::unordered_set<string> nodes_to_preserve = item.NodesToPreserve();
 
   // Prune all the nodes that won't be executed, ie all the nodes that aren't in
@@ -475,13 +459,18 @@ Status ModelPruner::Optimize(Cluster* cluster, const GrapplerItem& item,
 
   // Check if we can further prune the graph, by removing the trivial ops.
   absl::flat_hash_set<const NodeDef*> nodes_to_delete;
-  for (const auto& node : pruned_graph->node()) {
-    if (!IsTrivialOp(node, graph_view)) {
+  for (int i = 0; i < pruned_graph->node_size(); ++i) {
+    NodeDef* node = pruned_graph->mutable_node(i);
+    // Remove redundant control inputs, since they may prevent pruning below.
+    DedupControlInputs(node);
+
+    if (!IsTrivialOp(*node, graph_view)) {
+      VLOG(3) << node->name() << " is not trivial.";
       continue;
     }
 
     // Don't remove nodes that must be preserved.
-    if (nodes_to_preserve.find(node.name()) != nodes_to_preserve.end()) {
+    if (nodes_to_preserve.find(node->name()) != nodes_to_preserve.end()) {
       continue;
     }
 
@@ -499,8 +488,10 @@ Status ModelPruner::Optimize(Cluster* cluster, const GrapplerItem& item,
     //   converting references to non-references. It is important to preserve
     //   these non-references since the partitioner will avoid sending
     //   non-references across partitions more than once.
-    if (CanRemoveNode(node, graph_view, function_names, *op_registry)) {
-      nodes_to_delete.insert(&node);
+    if (CanRemoveNode(*node, graph_view, function_names, *op_registry)) {
+      nodes_to_delete.insert(node);
+    } else {
+      VLOG(3) << node->name() << " cannot be removed";
     }
   }
 
@@ -513,7 +504,7 @@ Status ModelPruner::Optimize(Cluster* cluster, const GrapplerItem& item,
   *optimized_graph->mutable_versions() = item.graph.versions();
   if (nodes_to_delete.empty()) {
     optimized_graph->mutable_node()->Swap(pruned_graph->mutable_node());
-    return Status::OK();
+    return absl::OkStatus();
   }
 
   const bool fetches_are_known = !item.fetch.empty();
@@ -535,12 +526,7 @@ Status ModelPruner::Optimize(Cluster* cluster, const GrapplerItem& item,
   if (optimized_graph->node_size() > item.graph.node_size()) {
     return errors::Internal("Pruning increased graph size.");
   }
-  return Status::OK();
-}
-
-void ModelPruner::Feedback(Cluster* cluster, const GrapplerItem& item,
-                           const GraphDef& optimized_graph, double result) {
-  // Nothing to do for ModelPruner.
+  return absl::OkStatus();
 }
 
 }  // end namespace grappler

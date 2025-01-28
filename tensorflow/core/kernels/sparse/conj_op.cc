@@ -15,11 +15,11 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #define EIGEN_USE_GPU
 #endif
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -27,12 +27,13 @@ limitations under the License.
 #include "tensorflow/core/framework/tensor_util.h"
 #include "tensorflow/core/framework/variant_op_registry.h"
 #include "tensorflow/core/kernels/cwise_ops.h"
+#include "tensorflow/core/kernels/cwise_ops_common.h"
 #include "tensorflow/core/kernels/sparse/kernels.h"
 #include "tensorflow/core/kernels/sparse/sparse_matrix.h"
 
-#if GOOGLE_CUDA
-#include "tensorflow/core/kernels/cuda_solvers.h"
-#include "tensorflow/core/kernels/cuda_sparse.h"
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#include "tensorflow/core/util/cuda_sparse.h"
+#include "tensorflow/core/util/gpu_solvers.h"
 #endif
 
 namespace tensorflow {
@@ -46,7 +47,7 @@ class CSRSparseMatrixConjFunctor {
  public:
   explicit CSRSparseMatrixConjFunctor(OpKernelContext* ctx) : ctx_(ctx) {}
 
-  Status operator()(const CSRSparseMatrix& a, CSRSparseMatrix* b) {
+  absl::Status operator()(const CSRSparseMatrix& a, CSRSparseMatrix* b) {
     const int total_nnz = a.total_nnz();
     Tensor b_values_t;
     TF_RETURN_IF_ERROR(ctx_->allocate_temp(
@@ -59,7 +60,7 @@ class CSRSparseMatrixConjFunctor {
     functor::UnaryFunctor<Device, functor::conj<T>> func;
     func(d, b->values().flat<T>() /*out*/, a.values().flat<T>() /*in*/);
 
-    return Status::OK();
+    return absl::OkStatus();
   }
 
  private:
@@ -76,7 +77,7 @@ class CSRSparseMatrixConjFunctor {
       TF_RETURN_IF_ERROR(CSRSparseMatrix::CreateCSRSparseMatrix(         \
           DataTypeToEnum<T>::value, a.dense_shape(), a.batch_pointers(), \
           a.row_pointers(), a.col_indices(), a.values(), b));            \
-      return Status::OK();                                               \
+      return OkStatus();                                                 \
     }                                                                    \
   };
 
@@ -87,12 +88,16 @@ NOOP_CONJ_FUNCTOR(double);
 
 }  // namespace
 
-#if GOOGLE_CUDA
+REGISTER_UNARY_VARIANT_UNARY_OP_FUNCTION(
+    CONJ_VARIANT_UNARY_OP, DEVICE_CPU, CSRSparseMatrix,
+    (CSRSparseMatrixUnaryHelper<CPUDevice, CSRSparseMatrixConjFunctor>));
+
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 REGISTER_UNARY_VARIANT_UNARY_OP_FUNCTION(
     CONJ_VARIANT_UNARY_OP, DEVICE_GPU, CSRSparseMatrix,
     (CSRSparseMatrixUnaryHelper<GPUDevice, CSRSparseMatrixConjFunctor>));
 
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 }  // namespace tensorflow

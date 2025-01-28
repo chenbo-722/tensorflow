@@ -17,19 +17,17 @@ load(
 
 # For platform specific build config
 load(
-    "//tensorflow/core/platform:default/build_config.bzl",
-    "tf_proto_library_cc",
+    "//tensorflow/core/platform:build_config.bzl",
+    "tf_proto_library",
 )
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     default_visibility = ["//visibility:private"],
-    licenses = ["notice"],  # Apache 2.0
+    licenses = ["notice"],
 )
 
-exports_files([
-    "LICENSE",
-    "placeholder.txt",
-])
+exports_files(["placeholder.txt"])
 
 cc_binary(
     name = "gen_proto_text_functions",
@@ -38,10 +36,10 @@ cc_binary(
     visibility = ["//tensorflow:internal"],
     deps = [
         ":gen_proto_text_functions_lib",
-        "@com_google_protobuf//:protobuf",
         "//tensorflow/core:lib_proto_parsing",
-        "//tensorflow/core:lib_proto_compiler",
-    ] + if_ios(["//tensorflow/core/platform/default/build_config:logging"]),
+        "@com_google_protobuf//:protobuf",
+        "@local_xla//xla/tsl/platform:protobuf_compiler",
+    ] + if_ios(["//tensorflow/core/platform:logging"]),
 )
 
 cc_library(
@@ -67,10 +65,11 @@ cc_library(
     }),
     deps = [
         "//tensorflow/core:lib_proto_parsing",
-    ] + if_ios(["//tensorflow/core/platform/default/build_config:logging"]),
+        "@com_google_absl//absl/strings:string_view",
+    ] + if_ios(["//tensorflow/core/platform:logging"]),
 )
 
-tf_proto_library_cc(
+tf_proto_library(
     name = "test_proto",
     srcs = ["test.proto"],
 )

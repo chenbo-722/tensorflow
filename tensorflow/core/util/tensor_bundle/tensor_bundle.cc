@@ -15,12 +15,15 @@ limitations under the License.
 
 #include "tensorflow/core/util/tensor_bundle/tensor_bundle.h"
 
-#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
 
+#include "absl/base/call_once.h"
+#include "absl/synchronization/mutex.h"
+#include "xla/tsl/lib/io/buffered_file.h"
+#include "xla/tsl/util/byte_swap_array.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/framework/tensor_shape.pb.h"
@@ -31,19 +34,31 @@ limitations under the License.
 #include "tensorflow/core/framework/variant_tensor_data.h"
 #include "tensorflow/core/framework/versions.h"
 #include "tensorflow/core/framework/versions.pb.h"
-#include "tensorflow/core/lib/bfloat16/bfloat16.h"
 #include "tensorflow/core/lib/core/coding.h"
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
-#include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/lib/hash/crc32c.h"
-#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/lib/io/table_builder.h"
-#include "tensorflow/core/lib/random/random.h"
-#include "tensorflow/core/lib/strings/stringprintf.h"
+#include "tensorflow/core/lib/strings/str_util.h"
+#include "tensorflow/core/platform/bfloat16.h"
+#include "tensorflow/core/platform/cord.h"
+#include "tensorflow/core/platform/errors.h"
+#include "tensorflow/core/platform/mem.h"
+#include "tensorflow/core/platform/path.h"
+#include "tensorflow/core/platform/random.h"
+#include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/platform/stringprintf.h"
+#include "tensorflow/core/platform/tstring.h"
+#include "tensorflow/core/util/env_var.h"
 #include "tensorflow/core/util/saved_tensor_slice_util.h"
-#include "tensorflow/core/util/tensor_bundle/byte_swap.h"
+#include "tensorflow/core/util/tensor_bundle/byte_swap_tensor.h"
+#include "tensorflow/core/util/tensor_bundle/naming.h"
 #include "tensorflow/core/util/tensor_slice_util.h"
+
+#ifdef PLATFORM_WINDOWS
+#undef DeleteFile
+#endif
 
 namespace tensorflow {
 
@@ -60,6 +75,13 @@ static const int kBufferSize = 1024 * 1024;
 // bundle.
 const char* const kHeaderEntryKey = "";
 
+// The size threshold for multi-threaded tensor loading.
+const int64_t kLargeTensorThreshold = static_cast<int64_t>(1) << 32;
+// Maximum number of threads to load the tensor from the file.
+const int kMaxFileReadThreads = 8;
+// Minimum size of a file section handled by each thread.
+const int64_t kMinSectionSize = static_cast<int64_t>(1) << 31;
+
 namespace {
 
 // Reads "num_elements" string elements from file[offset, offset+size) into the
@@ -67,14 +89,16 @@ namespace {
 //
 // Checksums the string lengths (as restored uint32 or uint64, not varint64
 // bytes) and string bytes, and stores it into "actual_crc32c".
-Status ReadStringTensor(io::InputBuffer* buffered_file, size_t num_elements,
-                        size_t offset, size_t size, tstring* destination,
-                        uint32* actual_crc32c, bool need_to_swap_bytes) {
-  if (size == 0) return Status::OK();
+absl::Status ReadStringTensor(io::InputBuffer* buffered_file,
+                              size_t num_elements, size_t offset, size_t size,
+                              tstring* destination, uint32* actual_crc32c,
+                              bool need_to_swap_bytes) {
+  if (size == 0) return absl::OkStatus();
   CHECK_GT(size, 0);
 
   // Reads "num_elements" varint64's from "buffered_file".
   TF_RETURN_IF_ERROR(buffered_file->Seek(offset));
+  TF_RETURN_IF_ERROR(buffered_file->Hint(size));
   std::vector<uint64> string_lengths(num_elements);
   for (size_t i = 0; i < num_elements; ++i) {
     TF_RETURN_IF_ERROR(buffered_file->ReadVarint64(&string_lengths[i]));
@@ -134,22 +158,24 @@ Status ReadStringTensor(io::InputBuffer* buffered_file, size_t num_elements,
         buffered_file->ReadNBytes(string_length, &(*buffer)[0], &bytes_read));
     *actual_crc32c = crc32c::Extend(*actual_crc32c, buffer->data(), bytes_read);
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status ReadVariantTensor(io::InputBuffer* buffered_file, Tensor* ret,
-                         size_t offset, size_t size, uint32* actual_crc32c) {
+absl::Status ReadVariantTensor(io::InputBuffer* buffered_file, Tensor* ret,
+                               size_t offset, size_t size,
+                               uint32* actual_crc32c) {
   // On-disk format:
   //   [varint64 len1][bytes variant1][4 byte checksum]
   //   ..
   //   [varint64 lenN][bytes variantN][4 byte checksum]
   // Var "crc32c" checksums all the lens, variant bytes, individual variant
   // checksums (as uint32, not varint32 bytes).
-  if (size == 0) return Status::OK();
+  if (size == 0) return absl::OkStatus();
   size_t num_elements = ret->NumElements();
 
   // Reads the actual string bytes.
   TF_RETURN_IF_ERROR(buffered_file->Seek(offset));
+  TF_RETURN_IF_ERROR(buffered_file->Hint(size));
   for (size_t i = 0; i < num_elements; ++i) {
     // Read the serialized variant length.
     uint64 string_length = 0;
@@ -196,7 +222,7 @@ Status ReadVariantTensor(io::InputBuffer* buffered_file, Tensor* ret,
     ret->flat<Variant>()(i) = std::move(v);
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 char* GetBackingBuffer(const Tensor& val) {
@@ -209,20 +235,20 @@ tstring* GetStringBackingBuffer(const Tensor& val) {
   return const_cast<tstring*>(val.flat<tstring>().data());
 }
 
-Status ParseEntryProto(StringPiece key, StringPiece value,
-                       protobuf::MessageLite* out) {
+absl::Status ParseEntryProto(StringPiece key, StringPiece value,
+                             protobuf::MessageLite* out) {
   if (!out->ParseFromArray(value.data(), value.size())) {
     return errors::DataLoss("Entry for key ", key, " not parseable.");
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Serializes the data bytes of the non-string tensor "val".  Discards the
 // original content of "bytes_written", and on OK updates it with number of
 // bytes written.
 // REQUIRES: val.dtype() != DT_STRING
-Status WriteTensor(const Tensor& val, FileOutputBuffer* out,
-                   size_t* bytes_written) {
+absl::Status WriteTensor(const Tensor& val, tsl::BufferedWritableFile* out,
+                         size_t* bytes_written) {
   DCHECK_NE(val.dtype(), DT_STRING);
   DCHECK_NE(val.dtype(), DT_VARIANT);
   *bytes_written = val.TotalBytes();
@@ -236,8 +262,9 @@ Status WriteTensor(const Tensor& val, FileOutputBuffer* out,
 //
 // Checksums all bytes written and stores it into "crc32c".
 // REQUIRES: val.dtype() == DT_STRING
-Status WriteStringTensor(const Tensor& val, FileOutputBuffer* out,
-                         size_t* bytes_written, uint32* crc32c) {
+absl::Status WriteStringTensor(const Tensor& val,
+                               tsl::BufferedWritableFile* out,
+                               size_t* bytes_written, uint32* crc32c) {
   // On-disk format:
   //   [varint64 len0]..[varint64 lenL][4 byte cksum on lengths][string bytes]
   // Var "crc32c" checksums the string lengths (as uint64, not varint64 bytes),
@@ -249,7 +276,7 @@ Status WriteStringTensor(const Tensor& val, FileOutputBuffer* out,
   string lengths;
   lengths.reserve(val.NumElements());  // At least 1 byte per element.
   *crc32c = 0;
-  for (int64 i = 0; i < val.NumElements(); ++i) {
+  for (int64_t i = 0; i < val.NumElements(); ++i) {
     const tstring* elem = &strings[i];
     DCHECK_EQ(elem->size(), static_cast<uint64>(elem->size()));
     const uint64 elem_size = static_cast<uint64>(elem->size());
@@ -279,17 +306,18 @@ Status WriteStringTensor(const Tensor& val, FileOutputBuffer* out,
   *bytes_written += sizeof(uint32);
 
   // Writes all the string bytes out.
-  for (int64 i = 0; i < val.NumElements(); ++i) {
+  for (int64_t i = 0; i < val.NumElements(); ++i) {
     const tstring* string = &strings[i];
     TF_RETURN_IF_ERROR(out->Append(*string));
     *bytes_written += string->size();
     *crc32c = crc32c::Extend(*crc32c, string->data(), string->size());
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status WriteVariantTensor(const Tensor& val, FileOutputBuffer* out,
-                          size_t* bytes_written, uint32* crc32c) {
+absl::Status WriteVariantTensor(const Tensor& val,
+                                tsl::BufferedWritableFile* out,
+                                size_t* bytes_written, uint32* crc32c) {
   // On-disk format:
   //   [varint64 len1][bytes variant1][4 byte checksum]
   //   ..
@@ -300,13 +328,17 @@ Status WriteVariantTensor(const Tensor& val, FileOutputBuffer* out,
 
   *crc32c = 0;
   *bytes_written = 0;
-  for (int64 i = 0; i < val.NumElements(); ++i) {
+  for (int64_t i = 0; i < val.NumElements(); ++i) {
     VariantTensorData data;
     val.flat<Variant>()(i).Encode(&data);
     VariantTensorDataProto proto;
     data.ToProto(&proto);
     string elem;
-    proto.SerializeToString(&elem);
+    if (!proto.SerializeToString(&elem)) {
+      return errors::Unknown(
+          "Failed to serialize tensor data of size ", proto.ByteSizeLong(),
+          ". Tensor: ", val.flat<Variant>()(i).DebugString());
+    }
 
     // Write the length of the serialized variant.
     DCHECK_EQ(elem.size(), static_cast<uint64>(elem.size()));
@@ -333,7 +365,7 @@ Status WriteVariantTensor(const Tensor& val, FileOutputBuffer* out,
     *bytes_written += sizeof(uint32);
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Returns whether "slice_spec" is a full slice, with respect to the full shape.
@@ -352,8 +384,8 @@ bool IsFullSlice(const TensorSlice& slice_spec,
   }
 }
 
-Status CorruptFileError(const Status& in_status, const string& filename,
-                        const string& detail) {
+absl::Status CorruptFileError(const absl::Status& in_status,
+                              const string& filename, const string& detail) {
   if (in_status.ok()) {
     return errors::Internal("Unable to read file (", filename,
                             "). Perhaps the file is corrupt or was produced by "
@@ -361,12 +393,12 @@ Status CorruptFileError(const Status& in_status, const string& filename,
                             "(",
                             detail, ")");
   }
-  return Status(
+  return absl::Status(
       in_status.code(),
       strings::StrCat("Unable to read file (", filename,
                       "). Perhaps the file is corrupt or was produced by a "
                       "newer version of TensorFlow with format changes (",
-                      detail, "): ", in_status.error_message()));
+                      detail, "): ", in_status.message()));
 }
 
 table::Options TableBuilderOptions() {
@@ -382,13 +414,14 @@ table::Options TableBuilderOptions() {
 // Writes zeros to output buffer to align the next write to the requested
 // alignment. "size" is the current size of the buffer and is updated to the
 // new size.
-Status PadAlignment(FileOutputBuffer* out, int alignment, int64* size) {
+absl::Status PadAlignment(tsl::BufferedWritableFile* out, int alignment,
+                          int64_t* size) {
   int bytes_over = *size % alignment;
   if (bytes_over == 0) {
-    return Status::OK();
+    return absl::OkStatus();
   }
   int bytes_to_write = alignment - bytes_over;
-  Status status = out->Append(string(bytes_to_write, '\0'));
+  absl::Status status = out->Append(string(bytes_to_write, '\0'));
   if (status.ok()) {
     *size += bytes_to_write;
   }
@@ -398,30 +431,33 @@ Status PadAlignment(FileOutputBuffer* out, int alignment, int64* size) {
 }  // namespace
 
 BundleWriter::BundleWriter(Env* env, StringPiece prefix, const Options& options)
-    : env_(env),
-      options_(options),
-      prefix_(prefix),
-      tmp_metadata_path_(strings::StrCat(MetaFilename(prefix_), ".tempstate",
-                                         random::New64())),
-      tmp_data_path_(strings::StrCat(DataFilename(prefix_, 0, 1), ".tempstate",
-                                     random::New64())),
-      out_(nullptr),
-      size_(0) {
+    : env_(env), options_(options), prefix_(prefix), out_(nullptr), size_(0) {
+  status_ = env_->HasAtomicMove(prefix_, &use_temp_file_);
+  if (!status_.ok()) return;
+
+  data_path_ = DataFilename(prefix_, 0, 1);
+  metadata_path_ = MetaFilename(prefix_);
+  if (use_temp_file_) {
+    data_path_ = strings::StrCat(data_path_, ".tempstate", random::New64());
+    metadata_path_ =
+        strings::StrCat(metadata_path_, ".tempstate", random::New64());
+  }
+
   status_ = env_->CreateDir(string(io::Dirname(prefix_)));
   if (!status_.ok() && !errors::IsAlreadyExists(status_)) {
     return;
   }
-  const string filename = DataFilename(prefix_, 0, 1);
-  std::unique_ptr<WritableFile> wrapper;
-  status_ = env_->NewWritableFile(tmp_data_path_, &wrapper);
-  if (!status_.ok()) return;
-  out_ = std::unique_ptr<FileOutputBuffer>(
-      new FileOutputBuffer(wrapper.release(), 8 << 20 /* 8MB write buffer */));
 
-  VLOG(1) << "Writing to file " << tmp_data_path_;
+  std::unique_ptr<WritableFile> wrapper;
+  status_ = env_->NewWritableFile(data_path_, &wrapper);
+  if (!status_.ok()) return;
+  out_ = std::make_unique<tsl::BufferedWritableFile>(
+      std::move(wrapper), 8 << 20 /* 8MB write buffer */);
+
+  VLOG(1) << "Writing to file " << data_path_;
 }
 
-Status BundleWriter::Add(StringPiece key, const Tensor& val) {
+absl::Status BundleWriter::Add(StringPiece key, const Tensor& val) {
   if (!status_.ok()) return status_;
   CHECK_NE(key, kHeaderEntryKey);
   const string key_string(key);
@@ -439,14 +475,14 @@ Status BundleWriter::Add(StringPiece key, const Tensor& val) {
   // Updates the data file.
   size_t data_bytes_written = 0;
   uint32 crc32c = 0;
-  out_->clear_crc32c();
+  out_->reset_crc32();
   if (val.dtype() == DT_STRING) {
     status_ = WriteStringTensor(val, out_.get(), &data_bytes_written, &crc32c);
   } else if (val.dtype() == DT_VARIANT) {
     status_ = WriteVariantTensor(val, out_.get(), &data_bytes_written, &crc32c);
   } else {
     status_ = WriteTensor(val, out_.get(), &data_bytes_written);
-    crc32c = out_->crc32c();
+    crc32c = out_->crc32();
   }
 
   if (status_.ok()) {
@@ -458,10 +494,10 @@ Status BundleWriter::Add(StringPiece key, const Tensor& val) {
   return status_;
 }
 
-Status BundleWriter::AddSlice(StringPiece full_tensor_key,
-                              const TensorShape& full_tensor_shape,
-                              const TensorSlice& slice_spec,
-                              const Tensor& slice_tensor) {
+absl::Status BundleWriter::AddSlice(StringPiece full_tensor_key,
+                                    const TensorShape& full_tensor_shape,
+                                    const TensorSlice& slice_spec,
+                                    const Tensor& slice_tensor) {
   if (!status_.ok()) return status_;
   CHECK_NE(full_tensor_key, kHeaderEntryKey);
 
@@ -501,21 +537,23 @@ Status BundleWriter::AddSlice(StringPiece full_tensor_key,
 
 // TODO(zongheng): on metadata write failure or !status_.ok(), consider removing
 // the orphaned data file.
-Status BundleWriter::Finish() {
+absl::Status BundleWriter::Finish() {
   if (out_) {
     status_.Update(out_->Close());
     out_ = nullptr;
     if (status_.ok()) {
-      status_ = Env::Default()->RenameFile(tmp_data_path_,
-                                           DataFilename(prefix_, 0, 1));
+      if (use_temp_file_) {
+        status_ =
+            Env::Default()->RenameFile(data_path_, DataFilename(prefix_, 0, 1));
+      }
     } else {
-      Env::Default()->DeleteFile(tmp_data_path_).IgnoreError();
+      Env::Default()->DeleteFile(data_path_).IgnoreError();
     }
   }
   if (!status_.ok()) return status_;
   // Build key -> BundleEntryProto table.
   std::unique_ptr<WritableFile> file;
-  status_ = env_->NewWritableFile(tmp_metadata_path_, &file);
+  status_ = env_->NewWritableFile(metadata_path_, &file);
   if (!status_.ok()) return status_;
   {
     // N.B.: the default use of Snappy compression may not be supported on all
@@ -542,15 +580,14 @@ Status BundleWriter::Finish() {
   }
   status_.Update(file->Close());
   if (!status_.ok()) {
-    Env::Default()->DeleteFile(tmp_metadata_path_).IgnoreError();
+    Env::Default()->DeleteFile(metadata_path_).IgnoreError();
     return status_;
-  } else {
-    status_ =
-        Env::Default()->RenameFile(tmp_metadata_path_, MetaFilename(prefix_));
+  } else if (use_temp_file_) {
+    status_ = Env::Default()->RenameFile(metadata_path_, MetaFilename(prefix_));
     if (!status_.ok()) return status_;
   }
   status_ = errors::Internal("BundleWriter is closed");
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Merging tensor bundles.
@@ -575,8 +612,8 @@ struct MergeState {
 
 // Merges entries of "prefix" into the accumulator state "merge".
 // Returns OK iff the merge succeeds.
-static Status MergeOneBundle(Env* env, StringPiece prefix,
-                             MergeState* merge_state) {
+static absl::Status MergeOneBundle(Env* env, StringPiece prefix,
+                                   MergeState* merge_state) {
   VLOG(1) << "Merging bundle:" << prefix;
   const string filename = MetaFilename(prefix);
   uint64 file_size;
@@ -599,7 +636,7 @@ static Status MergeOneBundle(Env* env, StringPiece prefix,
                               "failed to seek to header entry");
     }
     BundleHeaderProto header;
-    Status s = ParseEntryProto(iter->key(), iter->value(), &header);
+    absl::Status s = ParseEntryProto(iter->key(), iter->value(), &header);
     if (!s.ok()) return CorruptFileError(s, filename, "unable to parse header");
 
     merge_state->num_shards += header.num_shards();
@@ -671,20 +708,31 @@ static Status MergeOneBundle(Env* env, StringPiece prefix,
     to_merge_entry.set_shard_id(result.first->second);
     merge_state->entries[key] = to_merge_entry;
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status MergeBundles(Env* env, gtl::ArraySlice<tstring> prefixes,
-                    StringPiece merged_prefix) {
+absl::Status MergeBundles(Env* env, absl::Span<const tstring> prefixes,
+                          StringPiece merged_prefix, bool allow_missing_files) {
   // Merges all metadata tables.
   // TODO(zhifengc): KeyValue sorter if it becomes too big.
   MergeState merge;
-  Status status = env->CreateDir(string(io::Dirname(merged_prefix)));
+  absl::Status status = env->CreateDir(string(io::Dirname(merged_prefix)));
   if (!status.ok() && !errors::IsAlreadyExists(status)) return status;
-  for (int i = 0; i < prefixes.size(); ++i) {
-    TF_RETURN_IF_ERROR(MergeOneBundle(env, prefixes[i], &merge));
+  bool atleast_one_file_exists = false;
+  for (auto& prefix : prefixes) {
+    if (!env->FileExists(MetaFilename(prefix)).ok()) {
+      if (allow_missing_files) continue;
+      return errors::InvalidArgument(
+          "allow_missing_files was set to false and ", prefix,
+          " did not exist.", env->FileExists(prefix).ToString());
+    }
+    atleast_one_file_exists = true;
+    TF_RETURN_IF_ERROR(MergeOneBundle(env, prefix, &merge));
   }
-
+  if (!atleast_one_file_exists) {
+    return errors::InvalidArgument(
+        "At least one prefix checkpoint file must exist, but none existed.");
+  }
   // Renames data files to contain the merged bundle prefix.
   for (const auto& p : merge.shard_ids) {
     VLOG(1) << "Renaming " << p.first << " to "
@@ -717,7 +765,7 @@ Status MergeBundles(Env* env, gtl::ArraySlice<tstring> prefixes,
   VLOG(1) << "Merged bundles to:" << merged_prefix;
 
   // Cleanup: best effort based and ignores errors.
-  for (const string& prefix : prefixes) {
+  for (const tstring& prefix : prefixes) {
     env->DeleteFile(MetaFilename(prefix)).IgnoreError();
   }
   return status;
@@ -725,13 +773,29 @@ Status MergeBundles(Env* env, gtl::ArraySlice<tstring> prefixes,
 
 // Interface for reading a tensor bundle.
 
-BundleReader::BundleReader(Env* env, StringPiece prefix)
+BundleReader::BundleReader(
+    Env* env, StringPiece prefix,
+    bool enable_multi_threading_for_testing /* = false */)
+    : BundleReader(env, prefix, {nullptr, enable_multi_threading_for_testing}) {
+}
+
+BundleReader::BundleReader(Env* env, StringPiece prefix, Options options)
     : env_(env),
       prefix_(prefix),
+      cache_(options.cache),
       metadata_(nullptr),
       table_(nullptr),
+      index_cache_(nullptr),
       iter_(nullptr),
-      need_to_swap_bytes_(false) {
+      need_to_swap_bytes_(false),
+      enable_multi_threading_for_testing_(
+          options.enable_multi_threading_for_testing) {
+  if (cache_ == nullptr) {
+    // Make a cache for use just by this BundleReader.
+    owned_cache_ = std::make_unique<BundleCache>(env);
+    cache_ = owned_cache_.get();
+  }
+
   const string filename = MetaFilename(prefix_);
   uint64 file_size;
   status_ = env_->GetFileSize(filename, &file_size);
@@ -742,7 +806,17 @@ BundleReader::BundleReader(Env* env, StringPiece prefix)
   status_ = env_->NewRandomAccessFile(filename, &wrapper);
   if (!status_.ok()) return;
   metadata_ = wrapper.release();
-  status_ = table::Table::Open(table::Options(), metadata_, file_size, &table_);
+
+  table::Options o;
+  int64_t cache_size;
+  absl::Status s =
+      ReadInt64FromEnvVar("TF_TABLE_INDEX_CACHE_SIZE_IN_MB", 0, &cache_size);
+  if (s.ok() && cache_size > 0) {
+    index_cache_ = table::NewLRUCache(cache_size << 20);
+    o.block_cache = index_cache_;
+  }
+
+  status_ = table::Table::Open(o, metadata_, file_size, &table_);
   if (!status_.ok()) return;
   iter_ = table_->NewIterator();
 
@@ -773,18 +847,21 @@ BundleReader::~BundleReader() {
   delete metadata_;
   delete iter_;
   delete table_;
-  // InputBuffer does not own the underlying RandomAccessFile.
-  for (auto pair : data_) {
-    if (pair.second != nullptr && pair.second->file() != nullptr) {
-      delete pair.second->file();
-    }
+  if (index_cache_) {
+    delete index_cache_;
   }
-  gtl::STLDeleteValues(&data_);
-  gtl::STLDeleteValues(&tensor_slices_);
+  for (auto& temp : data_) {
+    delete temp.second;
+  }
+  for (auto& temp : tensor_slices_) {
+    delete temp.second;
+  }
+  data_.clear();
+  tensor_slices_.clear();
 }
 
-Status BundleReader::GetBundleEntryProto(StringPiece key,
-                                         BundleEntryProto* entry) {
+absl::Status BundleReader::GetBundleEntryProto(StringPiece key,
+                                               BundleEntryProto* entry) {
   entry->Clear();
   TF_CHECK_OK(status_);
   Seek(key);
@@ -800,11 +877,12 @@ Status BundleReader::GetBundleEntryProto(StringPiece key,
                             entry_copy.shape().ShortDebugString());
   }
 
-  *entry = entry_copy;
-  return Status::OK();
+  entry->Swap(&entry_copy);
+  return absl::OkStatus();
 }
 
-Status BundleReader::GetValue(const BundleEntryProto& entry, Tensor* val) {
+absl::Status BundleReader::GetValue(const BundleEntryProto& entry,
+                                    Tensor* val) {
   Tensor* ret = val;
   const TensorShape stored_shape(TensorShape(entry.shape()));
   if (val->NumElements() == 0) {
@@ -836,11 +914,10 @@ Status BundleReader::GetValue(const BundleEntryProto& entry, Tensor* val) {
   // Open the data file if it has not been opened.
   io::InputBuffer* buffered_file = data_[entry.shard_id()];
   if (buffered_file == nullptr) {
-    std::unique_ptr<RandomAccessFile> file = nullptr;
-    TF_RETURN_IF_ERROR(env_->NewRandomAccessFile(
+    RandomAccessFile* file = nullptr;
+    TF_RETURN_IF_ERROR(cache_->GetFile(
         DataFilename(prefix_, entry.shard_id(), num_shards_), &file));
-    buffered_file = new io::InputBuffer(file.release(), kBufferSize);
-    // The InputBuffer and RandomAccessFile objects are both released in dtor.
+    buffered_file = new io::InputBuffer(file, kBufferSize);
     data_[entry.shard_id()] = buffered_file;
   }
   CHECK(buffered_file != nullptr);
@@ -851,12 +928,59 @@ Status BundleReader::GetValue(const BundleEntryProto& entry, Tensor* val) {
   if (DataTypeCanUseMemcpy(entry.dtype())) {
     char* backing_buffer = const_cast<char*>((ret->tensor_data().data()));
     size_t unused_bytes_read;
-    if (entry.size() > kBufferSize) {
+    if (entry.size() > kBufferSize || enable_multi_threading_for_testing_) {
       StringPiece sp;
-      TF_RETURN_IF_ERROR(buffered_file->file()->Read(
-          entry.offset(), entry.size(), &sp, backing_buffer));
-      if (sp.data() != backing_buffer) {
-        memmove(backing_buffer, sp.data(), entry.size());
+      if (!enable_multi_threading_for_testing_ &&
+          entry.size() < kLargeTensorThreshold) {
+        TF_RETURN_IF_ERROR(buffered_file->file()->Read(
+            entry.offset(), entry.size(), &sp, backing_buffer));
+        if (sp.data() != backing_buffer) {
+          memmove(backing_buffer, sp.data(), entry.size());
+        }
+      } else {
+        int64_t section_size = kMinSectionSize;
+        int64_t thread_pool_size =
+            (entry.size() + kMinSectionSize - 1) / kMinSectionSize;
+        if (thread_pool_size > kMaxFileReadThreads ||
+            enable_multi_threading_for_testing_) {
+          thread_pool_size = kMaxFileReadThreads;
+          section_size =
+              (entry.size() + kMaxFileReadThreads - 1) / kMaxFileReadThreads;
+        }
+
+        std::vector<absl::Status> statuses(thread_pool_size);
+        auto reader_pool = std::make_unique<thread::ThreadPool>(
+            Env::Default(), "restore_large_tensor", thread_pool_size);
+
+        for (int i = 0; i < thread_pool_size; ++i) {
+          reader_pool->Schedule([&, i]() {
+            int64_t offset = i * section_size;
+            int64_t size = i == thread_pool_size - 1 ? entry.size() - offset
+                                                     : section_size;
+            std::unique_ptr<RandomAccessFile> section_reader = nullptr;
+            StringPiece sp;
+            if (auto file_status = env_->NewRandomAccessFile(
+                    DataFilename(prefix_, entry.shard_id(), num_shards_),
+                    &section_reader);
+                !file_status.ok()) {
+              statuses[i] = file_status;
+              return;
+            }
+
+            auto backing_buffer_current_pos = backing_buffer + offset;
+            auto status = section_reader->Read(entry.offset() + offset, size,
+                                               &sp, backing_buffer_current_pos);
+            if (sp.data() != backing_buffer_current_pos) {
+              memmove(backing_buffer_current_pos, sp.data(), size);
+            }
+            statuses[i] = std::move(status);
+          });
+        }
+        reader_pool = nullptr;  // Wait for reads to finish
+
+        for (const auto& status : statuses) {
+          TF_RETURN_IF_ERROR(status);
+        }
       }
     } else {
       TF_RETURN_IF_ERROR(buffered_file->ReadNBytes(entry.size(), backing_buffer,
@@ -889,17 +1013,18 @@ Status BundleReader::GetValue(const BundleEntryProto& entry, Tensor* val) {
   }
   if (crc32c::Unmask(entry.crc32c()) != actual_crc32c) {
     return errors::DataLoss(
-        "Checksum does not match: stored ",
+        "TensorBundle at ", prefix_, " shard ", entry.shard_id(), " (",
+        entry.size(), " bytes): Checksum does not match: stored ",
         strings::Printf("%08u", crc32c::Unmask(entry.crc32c())),
         " vs. calculated on the restored bytes ", actual_crc32c);
   }
 
   *val = *ret;
   if (ret != val) delete ret;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status BundleReader::Lookup(StringPiece key, Tensor* val) {
+absl::Status BundleReader::Lookup(StringPiece key, Tensor* val) {
   CHECK(val != nullptr);
   BundleEntryProto entry;
   TF_RETURN_IF_ERROR(GetBundleEntryProto(key, &entry));
@@ -913,7 +1038,7 @@ Status BundleReader::Lookup(StringPiece key, Tensor* val) {
   }
 }
 
-Status BundleReader::ReadCurrent(Tensor* val) {
+absl::Status BundleReader::ReadCurrent(Tensor* val) {
   CHECK(val != nullptr);
   BundleEntryProto entry;
   TF_RETURN_IF_ERROR(ParseEntryProto(iter_->key(), iter_->value(), &entry));
@@ -931,8 +1056,8 @@ Status BundleReader::ReadCurrent(Tensor* val) {
   }
 }
 
-Status BundleReader::LookupTensorSlices(StringPiece key,
-                                        std::vector<TensorSlice>* slices) {
+absl::Status BundleReader::LookupTensorSlices(
+    StringPiece key, std::vector<TensorSlice>* slices) {
   slices->clear();
   BundleEntryProto entry;
   TF_RETURN_IF_ERROR(GetBundleEntryProto(key, &entry));
@@ -940,20 +1065,21 @@ Status BundleReader::LookupTensorSlices(StringPiece key,
   for (const auto& slice : entry.slices()) {
     slices->emplace_back(slice);
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status BundleReader::LookupSlice(StringPiece full_tensor_key,
-                                 const TensorSlice& slice_spec, Tensor* val) {
+absl::Status BundleReader::LookupSlice(StringPiece full_tensor_key,
+                                       const TensorSlice& slice_spec,
+                                       Tensor* val) {
   CHECK(val != nullptr);
   BundleEntryProto entry;
   TF_RETURN_IF_ERROR(GetBundleEntryProto(full_tensor_key, &entry));
   return GetSliceValue(full_tensor_key, entry, slice_spec, val);
 }
 
-Status BundleReader::GetSliceValue(StringPiece full_tensor_key,
-                                   const BundleEntryProto& full_tensor_entry,
-                                   const TensorSlice& slice_spec, Tensor* val) {
+absl::Status BundleReader::GetSliceValue(
+    StringPiece full_tensor_key, const BundleEntryProto& full_tensor_entry,
+    const TensorSlice& slice_spec, Tensor* val) {
   using checkpoint::RegisterTensorSlice;
   using checkpoint::TensorSliceSet;
   DCHECK_GE(full_tensor_entry.slices_size(), 0);
@@ -1051,19 +1177,21 @@ Status BundleReader::GetSliceValue(StringPiece full_tensor_key,
       HANDLE_COPY(int8)
       HANDLE_COPY(complex64)
       HANDLE_COPY(complex128)
-      HANDLE_COPY(int64)
+      HANDLE_COPY(int64_t)
       HANDLE_COPY(bool)
       HANDLE_COPY(qint32)
       HANDLE_COPY(quint8)
       HANDLE_COPY(qint8)
       HANDLE_COPY(bfloat16)
+      HANDLE_COPY(int4)
+      HANDLE_COPY(uint4)
       default:
         return errors::InvalidArgument("Dtype ", DataTypeString(common_dtype),
                                        " not supported.");
     }
 #undef HANDLE_COPY
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 bool BundleReader::Contains(StringPiece key) {
@@ -1071,16 +1199,17 @@ bool BundleReader::Contains(StringPiece key) {
   return Valid() && (this->key() == key);
 }
 
-Status BundleReader::LookupDtypeAndShape(StringPiece key, DataType* dtype,
-                                         TensorShape* shape) {
+absl::Status BundleReader::LookupDtypeAndShape(StringPiece key, DataType* dtype,
+                                               TensorShape* shape) {
   BundleEntryProto entry;
   TF_RETURN_IF_ERROR(GetBundleEntryProto(key, &entry));
   *dtype = entry.dtype();
   *shape = TensorShape(entry.shape());
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status BundleReader::LookupTensorShape(StringPiece key, TensorShape* shape) {
+absl::Status BundleReader::LookupTensorShape(StringPiece key,
+                                             TensorShape* shape) {
   DataType ignored;
   return LookupDtypeAndShape(key, &ignored, shape);
 }
@@ -1101,49 +1230,42 @@ string BundleReader::DebugString() {
   return shape_str;
 }
 
-FileOutputBuffer::~FileOutputBuffer() { delete file_; }
+BundleCache::BundleCache(Env* env) : env_(env) {}
 
-Status FileOutputBuffer::Append(StringPiece data) {
-  // In the below, it is critical to calculate the checksum on the actually
-  // copied bytes, not the source bytes.  This is because "data" typically
-  // points to tensor buffers, which may be concurrently written.
-  if (data.size() + position_ <= buffer_size_) {
-    // Can fit into the current buffer.
-    memcpy(&buffer_[position_], data.data(), data.size());
-    crc32c_ = crc32c::Extend(crc32c_, &buffer_[position_], data.size());
-  } else if (data.size() <= buffer_size_) {
-    // Cannot fit, but can fit after flushing.
-    TF_RETURN_IF_ERROR(FlushBuffer());
-    memcpy(&buffer_[0], data.data(), data.size());
-    crc32c_ = crc32c::Extend(crc32c_, &buffer_[0], data.size());
-  } else {
-    // Cannot fit even after flushing.  So we break down "data" by chunk, and
-    // flush/checksum each chunk.
-    TF_RETURN_IF_ERROR(FlushBuffer());
-    for (size_t i = 0; i < data.size(); i += buffer_size_) {
-      const size_t nbytes = std::min(data.size() - i, buffer_size_);
-      memcpy(&buffer_[0], data.data() + i, nbytes);
-      crc32c_ = crc32c::Extend(crc32c_, &buffer_[0], nbytes);
-      position_ = nbytes;
-      TF_RETURN_IF_ERROR(FlushBuffer());
+BundleCache::FileState* BundleCache::EnsureOpened(std::string name) {
+  // Get the file, opening it if necessary.
+  FileState* f;
+  {
+    absl::MutexLock l(&mu_);
+    auto& slot = opened_files_[name];
+    if (slot == nullptr) {
+      slot = std::make_unique<FileState>();
     }
-    return Status::OK();
+    f = slot.get();
   }
-  position_ += data.size();
-  return Status::OK();
+
+  // Open the file or wait for a concurrent open to complete. We do not hold
+  // mu_ here to avoid blocking threads reading from other files.
+  absl::call_once(f->once, [this, name = std::move(name), f] {
+    f->open_status = env_->NewRandomAccessFile(name, &f->file);
+  });
+
+  return f;
 }
 
-Status FileOutputBuffer::Close() {
-  TF_RETURN_IF_ERROR(FlushBuffer());
-  return file_->Close();
+absl::Status BundleCache::GetFile(const std::string& fname,
+                                  RandomAccessFile** file) {
+  FileState* f = EnsureOpened(fname);
+  *file = f->file.get();
+  return f->open_status;
 }
 
-Status FileOutputBuffer::FlushBuffer() {
-  if (position_ > 0) {
-    TF_RETURN_IF_ERROR(file_->Append(StringPiece(&buffer_[0], position_)));
-    position_ = 0;
-  }
-  return Status::OK();
+namespace {
+inline char* AlignedMalloc(size_t size) {
+  char* buffer = static_cast<char*>(port::AlignedMalloc(size, 64));
+  DCHECK(buffer);
+  return buffer;
 }
+}  // namespace
 
 }  // namespace tensorflow

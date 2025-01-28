@@ -40,7 +40,7 @@ namespace tensorflow {
 
 class Stack : public ResourceBase {
  public:
-  static std::atomic<int64> stack_counter;
+  static std::atomic<int64_t> stack_counter;
 
   struct TensorAndAllocation {
     Tensor tensor;
@@ -54,18 +54,19 @@ class Stack : public ResourceBase {
         max_size_(max_size),
         closed_(false) {}
 
-  Status Push(const TensorAndAllocation& value) {
+  absl::Status Push(const TensorAndAllocation& value) {
     mutex_lock l(mu_);
     TF_RETURN_IF_ERROR(CheckNotClosed());
-    if (max_size_ >= 0 && stack_.size() >= max_size_) {
+    int stack_size = stack_.size();
+    if (max_size_ >= 0 && stack_size >= max_size_) {
       return errors::InvalidArgument("Stack[", stack_name_, "] overflowed ",
                                      "its max_size (", max_size_, ")");
     }
     stack_.push_back(value);
-    return Status::OK();
+    return absl::OkStatus();
   }
 
-  Status Pop(TensorAndAllocation* value) {
+  absl::Status Pop(TensorAndAllocation* value) {
     mutex_lock l(mu_);
     TF_RETURN_IF_ERROR(CheckNotClosed());
     if (stack_.empty()) {
@@ -74,7 +75,7 @@ class Stack : public ResourceBase {
     }
     *value = stack_.back();
     stack_.pop_back();
-    return Status::OK();
+    return absl::OkStatus();
   }
 
   // We don't swap the first tensor on the stack and any subsequent tensors
@@ -112,19 +113,19 @@ class Stack : public ResourceBase {
   const string stack_name_;
   Tensor handle_;
   int max_size_;
-  bool closed_ GUARDED_BY(mu_);
-  std::vector<TensorAndAllocation> stack_ GUARDED_BY(mu_);
+  bool closed_ TF_GUARDED_BY(mu_);
+  std::vector<TensorAndAllocation> stack_ TF_GUARDED_BY(mu_);
 
-  Status CheckNotClosed() const EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+  absl::Status CheckNotClosed() const TF_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     if (closed_) {
       return errors::InvalidArgument("Stack[", stack_name_,
                                      "] has already been closed.");
     }
-    return Status::OK();
+    return absl::OkStatus();
   }
 };
 
-Status GetStack(OpKernelContext* ctx, Stack** stack) {
+absl::Status GetStack(OpKernelContext* ctx, Stack** stack) {
   if (ctx->input_dtype(0) == DT_RESOURCE) {
     return LookupResource(ctx, HandleFromInput(ctx, 0), stack);
   } else {
@@ -145,12 +146,12 @@ Status GetStack(OpKernelContext* ctx, Stack** stack) {
     if (step_container == nullptr) {
       return errors::Internal("No step container.");
     }
-    TF_RETURN_IF_ERROR(rm->Lookup(step_container->name(), key, stack));
-    return Status::OK();
+    TF_RETURN_IF_ERROR(step_container->Lookup(rm, key, stack));
+    return absl::OkStatus();
   }
 }
 
-std::atomic<int64> Stack::stack_counter{0};
+std::atomic<int64_t> Stack::stack_counter{0};
 
 // StackOp
 
@@ -161,7 +162,7 @@ StackOp::StackOp(OpKernelConstruction* context) : OpKernel(context) {
 }
 
 void StackOp::Compute(OpKernelContext* ctx) {
-  int32 size = std::numeric_limits<int32>::max();
+  int32_t size = std::numeric_limits<int32>::max();
   if (ctx->num_inputs() > 0) {
     const Tensor* tensor_size;
     OP_REQUIRES_OK(ctx, ctx->input("max_size", &tensor_size));
@@ -171,7 +172,7 @@ void StackOp::Compute(OpKernelContext* ctx) {
         errors::InvalidArgument("Stack size must be a scalar, but had shape: ",
                                 tensor_size->shape().DebugString()));
 
-    int32 size_value = tensor_size->scalar<int32>()();
+    int32_t size_value = tensor_size->scalar<int32>()();
     if (size_value >= 0) {
       size = size_value;
     }
@@ -188,7 +189,7 @@ void StackOp::Compute(OpKernelContext* ctx) {
   OP_REQUIRES(ctx, step_container != nullptr,
               errors::Internal("No step container."));
   Stack* stack = new Stack(elem_type_, stack_name, size);
-  OP_REQUIRES_OK(ctx, rm->Create(step_container->name(), key, stack));
+  OP_REQUIRES_OK(ctx, step_container->Create(rm, key, stack));
   if (IsRefType(ctx->expected_output_dtype(0))) {
     // Create the stack handle.
     AllocatorAttributes alloc_attr;
@@ -204,7 +205,7 @@ void StackOp::Compute(OpKernelContext* ctx) {
     Tensor* handle;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &handle));
     handle->flat<ResourceHandle>()(0) =
-        MakePerStepResourceHandle<Stack>(ctx, key);
+        ctx->step_container()->MakeResourceHandle<Stack>(key, *ctx->device());
   }
 }
 
@@ -257,7 +258,7 @@ void StackPushOp::ComputeAsync(OpKernelContext* ctx, DoneCallback done) {
           new Tensor(cpu_allocator, tensor.dtype(), tensor.shape());
       device_ctxt->CopyDeviceTensorToCPU(
           &tensor, "StackPush", device, cpu_tensor,
-          [cpu_tensor, stack, ctx, done](const Status& s) {
+          [cpu_tensor, stack, ctx, done](const absl::Status& s) {
             ctx->SetStatus(s);
             if (s.ok()) {
               AllocatorAttributes alloc_attrs = ctx->input_alloc_attr(1);
@@ -306,7 +307,7 @@ void StackPopOp::ComputeAsync(OpKernelContext* ctx, DoneCallback done) {
         new Tensor(gpu_allocator, cpu_tensor->dtype(), cpu_tensor->shape());
     device_ctxt->CopyCPUTensorToDevice(
         cpu_tensor, device, device_tensor,
-        [device_tensor, ctx, done](const Status& s) {
+        [device_tensor, ctx, done](const absl::Status& s) {
           ctx->SetStatus(s);
           if (s.ok()) {
             ctx->set_output(0, *device_tensor);

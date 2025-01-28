@@ -17,9 +17,11 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/lite/toco/graph_transformations/graph_transformations.h"
 #include "tensorflow/lite/toco/model.h"
-#include "tensorflow/core/platform/logging.h"
 
 namespace toco {
 
@@ -32,9 +34,8 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
 }
 }  // namespace
 
-::tensorflow::Status PropagateArrayDataTypes::Run(Model* model,
-                                                  std::size_t op_index,
-                                                  bool* modified) {
+absl::Status PropagateArrayDataTypes::Run(Model* model, std::size_t op_index,
+                                          bool* modified) {
   *modified = false;
   auto it = model->operators.begin() + op_index;
   auto* op = it->get();
@@ -43,12 +44,12 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
   for (const auto& input : op->inputs) {
     if (!model->IsOptionalArray(input) &&
         model->GetArray(input).data_type == ArrayDataType::kNone) {
-      return ::tensorflow::Status::OK();
+      return absl::OkStatus();
     }
   }
   // Record data types of output before processing, so we can see at the
   // end if we changed anything, and return the correct boolean value.
-  std::unordered_map<string, ArrayDataType> old_output_data_types;
+  std::unordered_map<std::string, ArrayDataType> old_output_data_types;
   for (const auto& output : op->outputs) {
     old_output_data_types[output] = model->GetArray(output).data_type;
   }
@@ -72,10 +73,16 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
       SetDataTypeForAllOutputs(model, op, ArrayDataType::kBool);
       break;
     case OperatorType::kRank:
-    case OperatorType::kShape:
       // These operators only produce int32 outputs.
       SetDataTypeForAllOutputs(model, op, ArrayDataType::kInt32);
       break;
+    case OperatorType::kShape: {
+      // Shape op could produce int32 or int64 result. Set the output type
+      // based on the `output_data_type` field.
+      auto* shape_op = static_cast<TensorFlowShapeOperator*>(op);
+      SetDataTypeForAllOutputs(model, op, shape_op->output_data_type);
+      break;
+    }
     case OperatorType::kSplit:
     case OperatorType::kConcat:
     case OperatorType::kFill: {
@@ -140,7 +147,7 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
       auto* rand_op = static_cast<RandomUniformOperator*>(op);
       // The output type of RandomUniform is specified with an attribute
       if (rand_op->dtype == ArrayDataType::kNone) {
-        return ::tensorflow::Status::OK();
+        return absl::OkStatus();
       }
       CHECK_EQ(op->outputs.size(), 1);
       SetDataTypeForAllOutputs(model, op, rand_op->dtype);
@@ -162,10 +169,10 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
       // This can make unsupported_op->output_data_types have more elements than
       // op->outputs.
       if (unsupported_op->output_data_types.size() < op->outputs.size()) {
-        return ::tensorflow::Status::OK();
+        return absl::OkStatus();
       }
-      for (int i = 0; i < op->outputs.size(); ++i) {
-        const string& output = op->outputs[i];
+      for (size_t i = 0; i < op->outputs.size(); ++i) {
+        const std::string& output = op->outputs[i];
         const ArrayDataType data_type = unsupported_op->output_data_types[i];
         model->GetArray(output).data_type = data_type;
       }
@@ -173,7 +180,7 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
     }
     case OperatorType::kExpandDims: {
       // Yield on ExpandDim until it is converted to Reshape
-      return ::tensorflow::Status::OK();
+      return absl::OkStatus();
     }
     case OperatorType::kSelect: {
       // Select produces outputs with the same type as their 2nd input
@@ -247,13 +254,13 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
     }
     case OperatorType::kUnidirectionalSequenceLstm: {
       const ArrayDataType data_type = model->GetArray(op->inputs[0]).data_type;
-      if (data_type != ArrayDataType::kFloat) return ::tensorflow::Status::OK();
+      if (data_type != ArrayDataType::kFloat) return absl::OkStatus();
       SetDataTypeForAllOutputs(model, op, data_type);
       break;
     }
     case OperatorType::kUnidirectionalSequenceRnn: {
       const ArrayDataType data_type = model->GetArray(op->inputs[0]).data_type;
-      if (data_type != ArrayDataType::kFloat) return ::tensorflow::Status::OK();
+      if (data_type != ArrayDataType::kFloat) return absl::OkStatus();
       SetDataTypeForAllOutputs(model, op, data_type);
       break;
     }
@@ -267,13 +274,13 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
     }
     case OperatorType::kBidirectionalSequenceLstm: {
       const ArrayDataType data_type = model->GetArray(op->inputs[0]).data_type;
-      if (data_type != ArrayDataType::kFloat) return ::tensorflow::Status::OK();
+      if (data_type != ArrayDataType::kFloat) return absl::OkStatus();
       SetDataTypeForAllOutputs(model, op, data_type);
       break;
     }
     case OperatorType::kBidirectionalSequenceRnn: {
       const ArrayDataType data_type = model->GetArray(op->inputs[0]).data_type;
-      if (data_type != ArrayDataType::kFloat) return ::tensorflow::Status::OK();
+      if (data_type != ArrayDataType::kFloat) return absl::OkStatus();
       SetDataTypeForAllOutputs(model, op, data_type);
       break;
     }
@@ -312,10 +319,10 @@ void SetDataTypeForAllOutputs(Model* model, Operator* op,
   for (const auto& output : op->outputs) {
     if (old_output_data_types[output] != model->GetArray(output).data_type) {
       *modified = true;
-      return ::tensorflow::Status::OK();
+      return absl::OkStatus();
     }
   }
-  return ::tensorflow::Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace toco

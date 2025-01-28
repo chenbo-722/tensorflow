@@ -31,18 +31,15 @@ Output:
   original golden file (`./golden/compute_capability_golden.csv`) with the
   same file name and path.
 """
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import difflib
 import os
 import re
+import urllib.request as urllib
+
 from absl import app
 from absl import flags
 
-import six.moves.urllib.request as urllib
 
 FLAGS = flags.FLAGS
 PATH_TO_DIR = "tensorflow/tools/tensorflow_builder/config_detector"
@@ -61,21 +58,17 @@ def retrieve_from_web(generate_csv=False):
     NVIDIA page. Order goes from top to bottom of the webpage content (.html).
   """
   url = "https://developer.nvidia.com/cuda-gpus"
-  source = urllib.urlopen(url)
+  source = urllib.request.urlopen(url)
   matches = []
   while True:
     line = source.readline()
     if "</html>" in line:
       break
     else:
-      gpu = re.search(
-          r"<a href=.*>([\w\S\s\d\[\]\,]+[^*])</a>(<a href=.*)?.*",
-          line
-      )
+      gpu = re.search(r"<a href=.*>([\w\S\s\d\[\]\,]+[^*])</a>(<a href=.*)?.*",
+                      line)
       capability = re.search(
-          r"([\d]+).([\d]+)(/)?([\d]+)?(.)?([\d]+)?.*</td>.*",
-          line
-      )
+          r"([\d]+).([\d]+)(/)?([\d]+)?(.)?([\d]+)?.*</td>.*", line)
       if gpu:
         matches.append(gpu.group(1))
       elif capability:
@@ -155,9 +148,9 @@ def create_gpu_capa_map(match_list,
 
         gpu = ""
         cnt += 1
-        if len(gpu_capa.keys()) < cnt:
+        if len(list(gpu_capa.keys())) < cnt:
           mismatch_cnt += 1
-          cnt = len(gpu_capa.keys())
+          cnt = len(list(gpu_capa.keys()))
 
       else:
         gpu = match
@@ -180,7 +173,7 @@ def write_csv_from_dict(filename, input_dict):
     input_dict: Dictionary that is to be written out to a `.csv` file.
   """
   f = open(PATH_TO_DIR + "/data/" + filename, "w")
-  for k, v in input_dict.iteritems():
+  for k, v in input_dict.items():
     line = k
     for item in v:
       line += "," + item

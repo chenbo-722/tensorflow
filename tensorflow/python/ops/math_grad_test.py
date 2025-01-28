@@ -14,27 +14,49 @@
 # ==============================================================================
 """Tests for Python ops defined in math_grad.py."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+from absl.testing import parameterized
 import numpy as np
 
 from tensorflow.python.eager import backprop
 from tensorflow.python.eager import context
-from tensorflow.python.eager import execution_callbacks
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gradient_checker
 from tensorflow.python.ops import gradient_checker_v2
 from tensorflow.python.ops import gradients
+from tensorflow.python.ops import math_grad
 from tensorflow.python.ops import math_ops
 from tensorflow.python.platform import test
 
-RAISE = execution_callbacks.ExecutionCallback.RAISE
+
+class InferGradientReductionAxes(test.TestCase, parameterized.TestCase):
+
+  @parameterized.parameters(
+      (None, None, None, None),
+      (None, [], None, None),
+      ([], [], [], []),
+      ([], [None], [0], []),
+      ([None], [None], None, None),
+      ([None, 1], [None], [1], [0]),
+      ([None, 1], [1, None], [1], [0]),
+      ([None, 1], [2, None], None, None),
+      ([2], [1], [], [0]),
+      ([2], [2], [], []),
+      ([3, 1, 5, 1, 7], [2, 1, 4, 7], [1, 3], [0, 2]),
+  )
+  def testShapes(self, x_shape, y_shape, expected_x_axes, expected_y_axes):
+    x_axes1, y_axes1 = math_grad._InferGradientReductionAxes(
+        tensor_shape.TensorShape(x_shape), tensor_shape.TensorShape(y_shape))
+    y_axes2, x_axes2 = math_grad._InferGradientReductionAxes(
+        tensor_shape.TensorShape(y_shape), tensor_shape.TensorShape(x_shape))
+    self.assertEqual(x_axes1, x_axes2)
+    self.assertEqual(y_axes1, y_axes2)
+    self.assertEqual(expected_x_axes, x_axes1)
+    self.assertEqual(expected_y_axes, y_axes1)
 
 
 class SquaredDifferenceOpTest(test.TestCase):
@@ -48,7 +70,7 @@ class SquaredDifferenceOpTest(test.TestCase):
     l = np.random.randn(*left_shape)
     r = np.random.randn(*right_shape)
 
-    with self.cached_session(use_gpu=True):
+    with self.cached_session():
       left_tensor = constant_op.constant(l, shape=left_shape)
       right_tensor = constant_op.constant(r, shape=right_shape)
       output = math_ops.squared_difference(left_tensor, right_tensor)
@@ -85,7 +107,7 @@ class AbsOpTest(test.TestCase):
           self._biasedRandN(
               shape, bias=bias), dtype=dtype)
 
-    with self.cached_session(use_gpu=True):
+    with self.cached_session():
       output = math_ops.abs(value)
       error = gradient_checker.compute_gradient_error(
           value, shape, output, output.get_shape().as_list())
@@ -376,6 +398,43 @@ class SegmentMinOrMaxGradientTest(test.TestCase):
       self.assertLess(error, 1e-4)
 
 
+@test_util.run_all_in_graph_and_eager_modes
+class SegmentProdGradientTest(test.TestCase):
+
+  def _run_gradient_check(self, data, segment_ids):
+
+    def _segment_prod(x):
+      return math_ops.segment_prod(x, segment_ids)
+
+    err = gradient_checker_v2.max_error(
+        *gradient_checker_v2.compute_gradient(_segment_prod, [data]))
+    self.assertLess(err, 2e-4)
+
+  def testSegmentProdGradientWithoutOverlap(self):
+    data = constant_op.constant([[1, 2, 3, 4], [4, 3, 2, 1], [5, 6, 7, 8]],
+                                dtype=dtypes.float32)
+    segment_ids = constant_op.constant([0, 1, 2], dtype=dtypes.int64)
+    self._run_gradient_check(data, segment_ids)
+
+  def testSegmentProdGradientWithoutZeros(self):
+    data = constant_op.constant([[1, 2, 3, 4], [4, 3, 2, 1], [5, 6, 7, 8]],
+                                dtype=dtypes.float32)
+    segment_ids = constant_op.constant([0, 0, 1], dtype=dtypes.int64)
+    self._run_gradient_check(data, segment_ids)
+
+  def testSegmentProdGradientWithZeros(self):
+    data = constant_op.constant([[0, 2, 3, 4], [0, 0, 2, 0], [5, 0, 7, 0]],
+                                dtype=dtypes.float32)
+    segment_ids = constant_op.constant([0, 0, 1], dtype=dtypes.int64)
+    self._run_gradient_check(data, segment_ids)
+
+  def testSegmentProdGradientWithEmptySegment(self):
+    data = constant_op.constant([[1, 2, 3, 4], [4, 3, 2, 1], [5, 6, 7, 8]],
+                                dtype=dtypes.float32)
+    segment_ids = constant_op.constant([0, 0, 2], dtype=dtypes.int64)
+    self._run_gradient_check(data, segment_ids)
+
+
 class FloorModGradientTest(test.TestCase):
 
   @test_util.run_deprecated_v1
@@ -414,8 +473,8 @@ class DivNoNanGradientTest(test.TestCase):
     outputs = math_ops.div_no_nan(x, y)
     with self.cached_session():
       dx, dy = gradients.gradients(outputs, [x, y])
-      self.assertAllClose(dx.eval(), np.zeros(x.shape.as_list()))
-      self.assertAllClose(dy.eval(), np.zeros(y.shape.as_list()))
+      self.assertAllClose(dx, np.zeros(x.shape.as_list()))
+      self.assertAllClose(dy, np.zeros(y.shape.as_list()))
 
 
 class MulNoNanGradientTest(test.TestCase):
@@ -433,14 +492,14 @@ class MulNoNanGradientTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testGradientWithRhsIsZero(self):
-    x_vals = [0, 1.0, np.nan, np.inf, np.NINF]
+    x_vals = [0, 1.0, np.nan, np.inf, -np.inf]
     x = constant_op.constant(x_vals, dtype=dtypes.float32)
     y = array_ops.zeros_like(x, dtype=dtypes.float32)
     outputs = math_ops.mul_no_nan(x, y)
     with self.cached_session():
       dx, dy = gradients.gradients(outputs, [x, y])
-      self.assertAllClose(dx.eval(), np.zeros(x.shape.as_list()))
-      self.assertAllClose(dy.eval(), x_vals)
+      self.assertAllClose(dx, np.zeros(x.shape.as_list()))
+      self.assertAllClose(dy, x_vals)
 
 
 class XlogyTest(test.TestCase):
@@ -489,6 +548,56 @@ class XlogyTest(test.TestCase):
       zero = self.evaluate(x)
       self.assertAllClose(zero, xlogy_xgrad)
       self.assertAllClose(zero, xlogy_ygrad)
+
+
+class Xlog1pyTest(test.TestCase):
+
+  def _xlog1py_gradients(self, x, y):
+    xlog1py_xgrad = self.evaluate(
+        gradients.gradients(math_ops.xlog1py(x, y), x)[0])
+    xlog1py_ygrad = self.evaluate(
+        gradients.gradients(math_ops.xlog1py(x, y), y)[0])
+    return xlog1py_xgrad, xlog1py_ygrad
+
+  @test_util.run_deprecated_v1
+  def testNonZeroValuesGrad(self):
+    for dtype in [dtypes.float16, dtypes.float32, dtypes.float64]:
+      x = constant_op.constant(0.1, dtype=dtype)
+      y = constant_op.constant(3.1, dtype=dtype)
+      xlog1py_xgrad, xlog1py_ygrad = self._xlog1py_gradients(x, y)
+      xlog1py_expected_xgrad = self.evaluate(math_ops.log1p(y))
+      xlog1py_expected_ygrad = self.evaluate(x / (1. + y))
+      self.assertAllClose(xlog1py_expected_xgrad, xlog1py_xgrad)
+      self.assertAllClose(xlog1py_expected_ygrad, xlog1py_ygrad)
+
+  @test_util.run_deprecated_v1
+  def testZeroXGrad(self):
+    for dtype in [dtypes.float16, dtypes.float32, dtypes.float64]:
+      x = constant_op.constant(0., dtype=dtype)
+      y = constant_op.constant(3.1, dtype=dtype)
+      xlog1py_xgrad, xlog1py_ygrad = self._xlog1py_gradients(x, y)
+      zero = self.evaluate(x)
+      self.assertAllClose(zero, xlog1py_xgrad)
+      self.assertAllClose(zero, xlog1py_ygrad)
+
+  @test_util.run_deprecated_v1
+  def testNegOneYGrad(self):
+    for dtype in [dtypes.float16, dtypes.float32, dtypes.float64]:
+      x = constant_op.constant(0.1, dtype=dtype)
+      y = constant_op.constant(-1., dtype=dtype)
+      xlog1py_xgrad, xlog1py_ygrad = self._xlog1py_gradients(x, y)
+      self.assertAllClose(-np.inf, xlog1py_xgrad)
+      self.assertAllClose(np.inf, xlog1py_ygrad)
+
+  @test_util.run_deprecated_v1
+  def testZeroXNegOneYGrad(self):
+    for dtype in [dtypes.float16, dtypes.float32, dtypes.float64]:
+      x = constant_op.constant(0., dtype=dtype)
+      y = constant_op.constant(-1., dtype=dtype)
+      xlog1py_xgrad, xlog1py_ygrad = self._xlog1py_gradients(x, y)
+      zero = self.evaluate(x)
+      self.assertAllClose(zero, xlog1py_xgrad)
+      self.assertAllClose(zero, xlog1py_ygrad)
 
 
 class XdivyTest(test.TestCase):
@@ -551,13 +660,12 @@ class PowGradTest(test.TestCase):
     self.assertAllClose([-2., 0., 2.], g)
 
   def test_zero_grad_tape(self):
-    with execution_callbacks.errstate(inf_or_nan=RAISE):
-      x = constant_op.constant([-1, 0., 1.])
-      with backprop.GradientTape() as tape:
-        tape.watch(x)
-        g = tape.gradient(math_ops.pow(x, 2), x)
-      g = self.evaluate(g)
-      self.assertAllClose([-2., 0., 2.], g)
+    x = constant_op.constant([-1, 0., 1.])
+    with backprop.GradientTape() as tape:
+      tape.watch(x)
+      g = tape.gradient(math_ops.pow(x, 2), x)
+    g = self.evaluate(g)
+    self.assertAllClose([-2., 0., 2.], g)
 
 
 @test_util.run_all_in_graph_and_eager_modes

@@ -18,10 +18,11 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/lite/toco/graph_transformations/graph_transformations.h"
 #include "tensorflow/lite/toco/model.h"
 #include "tensorflow/lite/toco/tooling_util.h"
-#include "tensorflow/core/platform/logging.h"
 
 namespace toco {
 
@@ -39,11 +40,11 @@ namespace toco {
   const auto concat_it = model->operators.begin() + op_index;
   auto* concat_op = concat_it->get();
   if (concat_op->type != OperatorType::kConcatenation) {
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
-  std::vector<string> trivial_inputs;
-  std::vector<string> nontrivial_inputs;
-  for (const string& input : concat_op->inputs) {
+  std::vector<std::string> trivial_inputs;
+  std::vector<std::string> nontrivial_inputs;
+  for (const std::string& input : concat_op->inputs) {
     const auto& input_array = model->GetArray(input);
     const bool is_trivial =
         input_array.has_shape() && input_array.shape().dimensions_count() == 0;
@@ -55,16 +56,16 @@ namespace toco {
   }
 
   if (trivial_inputs.empty()) {
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   // Drop trivial inputs.
   concat_op->inputs = nontrivial_inputs;
-  for (const string& input : trivial_inputs) {
+  for (const std::string& input : trivial_inputs) {
     DeleteArrayIfUnusedOutsideOfOp(input, concat_op, model);
   }
   *modified = true;
-  return ::tensorflow::Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace toco

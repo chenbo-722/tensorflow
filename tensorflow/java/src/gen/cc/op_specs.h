@@ -22,6 +22,7 @@ limitations under the License.
 #include "tensorflow/core/framework/api_def.pb.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/op_def.pb.h"
+#include "tensorflow/core/platform/types.h"
 #include "tensorflow/java/src/gen/cc/java_defs.h"
 
 namespace tensorflow {
@@ -36,7 +37,7 @@ class EndpointSpec {
   // package: package of this endpoint (from which also derives its package)
   // name: name of this endpoint class
   // javadoc: the endpoint class documentation
-  // TODO(annarev): hardcode depcreated to false until deprecated is possible
+  // TODO(annarev): hardcode deprecated to false until deprecated is possible
   EndpointSpec(const string& package, const string& name,
                const Javadoc& javadoc)
       : package_(package), name_(name), javadoc_(javadoc), deprecated_(false) {}

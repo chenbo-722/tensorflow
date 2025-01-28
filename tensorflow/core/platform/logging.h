@@ -16,34 +16,21 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_PLATFORM_LOGGING_H_
 #define TENSORFLOW_CORE_PLATFORM_LOGGING_H_
 
-#include "tensorflow/core/platform/platform.h"  // To pick up PLATFORM_define
+#include "tensorflow/core/platform/types.h"   // IWYU pragma: export
+#include "tsl/platform/logging.h"  // IWYU pragma: export
 
-#if defined(PLATFORM_GOOGLE) || defined(PLATFORM_GOOGLE_ANDROID) || \
-    defined(GOOGLE_LOGGING) || defined(__EMSCRIPTEN__)
-#include "tensorflow/core/platform/google/build_config/logging.h"
+// NOLINTBEGIN(misc-unused-using-decls)
 namespace tensorflow {
-// Adapt Google LogSink interface to the TF interface.
-using TFLogSink = ::absl::LogSink;
-using TFLogEntry = ::absl::LogEntry;
-
-inline void TFAddLogSink(TFLogSink* sink) { ::absl::AddLogSink(sink); }
-inline void TFRemoveLogSink(TFLogSink* sink) { ::absl::RemoveLogSink(sink); }
-
-}  // namespace tensorflow
-
-#else
-#include "tensorflow/core/platform/default/logging.h"
-#endif
-
-namespace tensorflow {
-
 namespace internal {
-// Emit "message" as a log message to the log for the specified
-// "severity" as if it came from a LOG call at "fname:line"
-void LogString(const char* fname, int line, int severity,
-               const string& message);
+using tsl::internal::LogString;
 }  // namespace internal
-
+using tsl::TFAddLogSink;
+using tsl::TFGetLogSinks;
+using tsl::TFLogEntry;
+using tsl::TFLogSink;
+using tsl::TFRemoveLogSink;
+using tsl::UpdateLogVerbosityIfDefined;
 }  // namespace tensorflow
+// NOLINTEND(misc-unused-using-decls)
 
 #endif  // TENSORFLOW_CORE_PLATFORM_LOGGING_H_

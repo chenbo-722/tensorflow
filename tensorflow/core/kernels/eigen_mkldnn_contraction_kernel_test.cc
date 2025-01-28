@@ -13,14 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Need to #include Eigen's Tensor class first because Eigen/CXX11/FixedPoint
-// depends on the file but doesn't include it. This breaks compilation on
-// clang.
-// clang-format off
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-// clang-format on
-#include "third_party/eigen3/unsupported/Eigen/CXX11/FixedPoint"
-#include "tensorflow/core/kernels/eigen_contraction_kernel.h"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
+#include "xla/tsl/framework/contraction/eigen_contraction_kernel.h"
+#include "xla/tsl/framework/fixedpoint/FixedPoint.h"
 #include "tensorflow/core/platform/test.h"
 
 namespace Eigen {
@@ -113,14 +108,15 @@ TEST(EigenMkldnnTest, MkldnnGemm) {
   // Compute matmul with mkldnn gemm kernel.
   using OutputMapper = blas_data_mapper<Scalar, Index, ColMajor>;
   using MkldnnGemmKernel =
-      mkldnn_gemm_kernel<Scalar, Index, OutputMapper, ColMajor>;
+      dnnl_gemm_kernel<Scalar, Index, OutputMapper, ColMajor>;
 
   Tensor2d mkldnn_result(m, n);
-  mkldnn_result.setZero();
+  mkldnn_result.setRandom();
   OutputMapper output_mapper(mkldnn_result.data(), m);
 
   MkldnnGemmKernel gemm_kernel;
-  gemm_kernel(output_mapper, lhs.data(), rhs.data(), m, k, n, /*alpha=*/1.0);
+  gemm_kernel(output_mapper, lhs.data(), rhs.data(), m, k, n, /*alpha=*/1.0,
+              /*beta=*/0.0);
 
   // Compute matmul with Eigen::Matrix.
   using Matrix = Eigen::Matrix<Scalar, Dynamic, Dynamic, ColMajor>;

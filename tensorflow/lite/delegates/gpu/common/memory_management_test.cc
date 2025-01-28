@@ -15,8 +15,15 @@ limitations under the License.
 
 #include "tensorflow/lite/delegates/gpu/common/memory_management.h"
 
+#include <cstddef>
+#include <vector>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "tensorflow/lite/delegates/gpu/common/memory_management/types.h"
+#include "tensorflow/lite/delegates/gpu/common/shape.h"
+#include "tensorflow/lite/delegates/gpu/common/types.h"
 
 namespace tflite {
 namespace gpu {
@@ -317,6 +324,14 @@ TEST(Model, UInt2Records) {
                           uint2(8, 2), uint2(2, 8), uint2(1, 8), uint2(2, 8),
                           uint2(4, 1)));
 
+  ASSERT_TRUE(AssignObjectsToTensors(usage_records, MemoryStrategy::EQUALITY,
+                                     &assignment)
+                  .ok());
+  EXPECT_THAT(assignment.object_ids, ElementsAre(0, 1, 2, 0, 3, 1, 4, 0, 5));
+  EXPECT_THAT(assignment.object_sizes,
+              ElementsAre(uint2(2, 8), uint2(2, 8), uint2(1, 12), uint2(8, 2),
+                          uint2(1, 8), uint2(4, 1)));
+
   ASSERT_TRUE(AssignObjectsToTensors(
                   usage_records, MemoryStrategy::GREEDY_IN_ORDER, &assignment)
                   .ok());
@@ -347,6 +362,15 @@ TEST(Model, UInt3Records) {
                           uint3(2, 4, 1), uint3(2, 2, 2), uint3(8, 1, 2),
                           uint3(1, 2, 1), uint3(1, 1, 1), uint3(2, 2, 2)));
 
+  ASSERT_TRUE(AssignObjectsToTensors(usage_records, MemoryStrategy::EQUALITY,
+                                     &assignment)
+                  .ok());
+  EXPECT_THAT(assignment.object_ids, ElementsAre(0, 1, 2, 3, 4, 5, 6, 2, 4));
+  EXPECT_THAT(assignment.object_sizes,
+              ElementsAre(uint3(1, 2, 8), uint3(4, 3, 2), uint3(1, 1, 1),
+                          uint3(2, 4, 1), uint3(2, 2, 2), uint3(8, 1, 2),
+                          uint3(1, 2, 1)));
+
   ASSERT_TRUE(AssignObjectsToTensors(
                   usage_records, MemoryStrategy::GREEDY_IN_ORDER, &assignment)
                   .ok());
@@ -354,6 +378,25 @@ TEST(Model, UInt3Records) {
   EXPECT_THAT(assignment.object_sizes,
               ElementsAre(uint3(1, 2, 8), uint3(4, 3, 2), uint3(2, 4, 1),
                           uint3(8, 1, 2)));
+}
+
+TEST(Model, OffsetAssignmentWithAlignment) {
+  std::vector<TensorUsageRecord<size_t>> usage_records{
+      {/*size=*/16, /*first=*/0, /*last=*/1},
+      {/*size=*/8, /*first=*/1, /*last=*/2},
+      {/*size=*/64, /*first=*/2, /*last=*/3},
+      {/*size=*/32, /*first=*/3, /*last=*/4},
+      {/*size=*/8, /*first=*/4, /*last=*/5},
+  };
+
+  OffsetsAssignment offsets_assignment;
+  ASSERT_TRUE(AssignOffsetsToTensors(usage_records,
+                                     MemoryStrategy::GREEDY_BY_SIZE,
+                                     &offsets_assignment,
+                                     /*base_addr_align_bytes=*/128)
+                  .ok());
+  EXPECT_THAT(offsets_assignment.offsets, ElementsAre(0, 128, 0, 128, 0));
+  EXPECT_EQ(offsets_assignment.total_size, 160);
 }
 
 }  // namespace

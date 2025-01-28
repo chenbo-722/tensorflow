@@ -13,16 +13,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+#include <vector>
+
+#include "absl/types/span.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/client/lib/arithmetic.h"
-#include "tensorflow/compiler/xla/client/lib/constants.h"
-#include "tensorflow/compiler/xla/client/lib/math.h"
-#include "tensorflow/compiler/xla/client/xla_builder.h"
-#include "tensorflow/compiler/xla/client/xla_computation.h"
-#include "tensorflow/core/platform/macros.h"
+#include "xla/hlo/builder/lib/constants.h"
+#include "xla/hlo/builder/lib/math.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/builder/xla_computation.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
+#include "xla/xla_data.pb.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/op_requires.h"
+#include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/platform/errors.h"
+#include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 namespace {
@@ -48,10 +59,6 @@ class QuantizeAndDequantizeOp : public XlaOpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("range_given", &range_given_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("narrow_range", &narrow_range_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("axis", &axis_));
-    // TODO(b/140109958): Implement for axis != -1.
-    OP_REQUIRES(ctx, axis_ == -1,
-                errors::Unimplemented("QuantizeAndDequantizeOp with axis >= 0 "
-                                      "not yet implemented for XLA"));
     round_mode_ = ROUND_HALF_TO_EVEN;
   }
 
@@ -73,8 +80,30 @@ class QuantizeAndDequantizeOp : public XlaOpKernel {
     } else {
       const xla::XlaComputation* fmax = ctx->GetOrCreateMax(data_type);
       const xla::XlaComputation* fmin = ctx->GetOrCreateMin(data_type);
-      min_range = ReduceAll(input, xla::MaxValue(b, xla_type), *fmin);
-      max_range = ReduceAll(input, xla::MinValue(b, xla_type), *fmax);
+      if (axis_ == -1) {
+        min_range = ReduceAll(input, xla::MaxValue(b, xla_type), *fmin);
+        max_range = ReduceAll(input, xla::MinValue(b, xla_type), *fmax);
+      } else {
+        std::vector<int64_t> dimensions_to_reduce;
+        TensorShape input_shape = ctx->InputShape(0);
+        int64_t input_rank = input_shape.dims();
+        OP_REQUIRES(ctx, input_rank >= 1,
+                    errors::Unimplemented("QuantizeAndDequantizeOp with axis "
+                                          "!= -1 requires minimum rank 1"));
+        OP_REQUIRES(
+            ctx, axis_ >= 0 && axis_ < input_rank,
+            errors::Unimplemented("QuantizeAndDequantizeOp with invalid axis"));
+        dimensions_to_reduce.reserve(input_rank - 1);
+        for (int64_t i = 0; i < input_rank; ++i) {
+          if (i != axis_) {
+            dimensions_to_reduce.push_back(i);
+          }
+        }
+        min_range = Reduce(input, xla::MaxValue(b, xla_type), *fmin,
+                           dimensions_to_reduce);
+        max_range = Reduce(input, xla::MinValue(b, xla_type), *fmax,
+                           dimensions_to_reduce);
+      }
     }
 
     xla::XlaOp num_bits;
@@ -136,6 +165,23 @@ class QuantizeAndDequantizeOp : public XlaOpKernel {
     min_range = Select(cond, min_range, min_quantized * inverse_scale);
     max_range = Select(cond, max_quantized * inverse_scale, max_range);
 
+    // The instruction min_range has the shape of the axis, which is also the
+    // shape for max_range, scale and inverse_scale.
+    xla::Shape axis_shape = b->GetShape(min_range).value();
+    // The XLA client library can handle implicit broadcast from scalar. Add
+    // explicit broadcast if the axis has a non-scalar shape.
+    if (!xla::ShapeUtil::IsScalar(axis_shape)) {
+      xla::Shape input_shape = b->GetShape(input).value();
+      absl::Span<const int64_t> input_dimensions = input_shape.dimensions();
+      auto convert_to_input_shape = [&](const xla::XlaOp op) {
+        return xla::BroadcastInDim(op, input_dimensions, {axis_});
+      };
+      min_range = convert_to_input_shape(min_range);
+      max_range = convert_to_input_shape(max_range);
+      scale = convert_to_input_shape(scale);
+      inverse_scale = convert_to_input_shape(inverse_scale);
+    }
+
     if (range_given_) {
       // Note: The clamping here is to avoid overflow in the quantized type.
       // The semantics of the op does not guarantee to clamp to the specified
@@ -160,7 +206,7 @@ class QuantizeAndDequantizeOp : public XlaOpKernel {
   }
 
  protected:
-  int64 num_bits_ = -1;
+  int64_t num_bits_ = -1;
   int axis_;
   bool signed_input_;
   bool range_given_;
@@ -195,6 +241,7 @@ class QuantizeAndDequantizeV2Op : public QuantizeAndDequantizeOp {
 
 REGISTER_XLA_OP(Name("QuantizeAndDequantizeV2"), QuantizeAndDequantizeV2Op);
 REGISTER_XLA_OP(Name("QuantizeAndDequantizeV3"), QuantizeAndDequantizeOp);
+REGISTER_XLA_OP(Name("QuantizeAndDequantizeV4"), QuantizeAndDequantizeV2Op);
 
 }  // namespace
 }  // namespace tensorflow

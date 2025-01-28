@@ -44,9 +44,12 @@ extern const char kXlaReplicaIdAttrName[];
 // This node is a Placeholder node added for tail outside compilation.
 extern const char kXlaIsPlaceholderForTailOcAttrName[];
 
+// This attribute is the original node name for this node.
+extern const char kXlaOriginalOutsideCompilationNodeName[];
+
 // Sets device ordinal attribute for nodes with attribute
 // `kXlaHasHostTransferAttrName`.
-Status SetDeviceOrdinalAttributeForNode(Node* node, int device_ordinal);
+absl::Status SetDeviceOrdinalAttributeForNode(Node* node, int device_ordinal);
 
 // Calculates side-effect dependencies for the graph's token output.
 // Returns a set of node names representing these dependencies.
@@ -58,8 +61,8 @@ bool HasSideEffectingNodes(const Graph& g);
 // Parse the mapping from outside_compilation_subgraph name to core number,
 // which is specified in an attr as a list of strings
 // <subgraph_name>:<core_index>.
-Status ParseHostComputeCoreList(absl::Span<const string> list_from_attr,
-                                std::map<string, int>* host_compute_core);
+absl::Status ParseHostComputeCoreList(absl::Span<const string> list_from_attr,
+                                      std::map<string, int>* host_compute_core);
 
 }  // namespace tensorflow
 

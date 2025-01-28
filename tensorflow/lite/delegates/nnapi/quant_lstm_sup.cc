@@ -16,6 +16,7 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
 
 namespace tflite {
@@ -36,7 +37,7 @@ void ExtractQuantLstmWeightsSubmatrix(const TfLiteIntArray* submatrix_dims,
 
   submatrix->resize(NumElements(submatrix_dims));
 
-  for (uint32_t i = 0; i < submatrix_rows * submatrix_cols; ++i) {
+  for (uint32_t i = 0, end = submatrix_rows * submatrix_cols; i < end; ++i) {
     const uint32_t row = i / submatrix_cols;
     const uint32_t column = i % submatrix_cols;
     (*submatrix)[i] =

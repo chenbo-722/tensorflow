@@ -39,9 +39,9 @@ namespace {
 
 void PickOutputMultiplier(
     const DepthwiseParams& params, const RuntimeShape& input_shape,
-    const int8* input_data, const RuntimeShape& filter_shape,
-    const int8* filter_data, const RuntimeShape& bias_shape,
-    const int32* bias_data, const RuntimeShape& output_shape,
+    const int8_t* input_data, const RuntimeShape& filter_shape,
+    const int8_t* filter_data, const RuntimeShape& bias_shape,
+    const int32_t* bias_data, const RuntimeShape& output_shape,
     float* output_multiplier) {
   const int stride_width = params.stride_width;
   const int stride_height = params.stride_height;
@@ -50,7 +50,7 @@ void PickOutputMultiplier(
   const int pad_width = params.padding_values.width;
   const int pad_height = params.padding_values.height;
   const int depth_multiplier = params.depth_multiplier;
-  const int32 input_offset = params.input_offset;
+  const int32_t input_offset = params.input_offset;
 
   const int batches = MatchingDim(input_shape, 0, output_shape, 0);
   const int input_height = input_shape.Dims(1);
@@ -72,7 +72,7 @@ void PickOutputMultiplier(
             const int output_channel = m + in_channel * depth_multiplier;
             const int in_x_origin = (out_x * stride_width) - pad_width;
             const int in_y_origin = (out_y * stride_height) - pad_height;
-            int32 acc = 0;
+            int32_t acc = 0;
             for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
               for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
                 const int in_x = in_x_origin + dilation_width_factor * filter_x;
@@ -83,9 +83,9 @@ void PickOutputMultiplier(
                     (in_x >= 0) && (in_x < input_width) && (in_y >= 0) &&
                     (in_y < input_height);
                 if (is_point_inside_image) {
-                  int32 input_val = input_data[Offset(input_shape, batch, in_y,
-                                                      in_x, in_channel)];
-                  int32 filter_val = filter_data[Offset(
+                  int32_t input_val = input_data[Offset(
+                      input_shape, batch, in_y, in_x, in_channel)];
+                  int32_t filter_val = filter_data[Offset(
                       filter_shape, 0, filter_y, filter_x, output_channel)];
                   acc += filter_val * (input_val + input_offset);
                 }
@@ -139,7 +139,6 @@ void PickReasonableMultiplier(
   }
 }
 
-#if defined(__aarch64__) && !defined(GOOGLE_L4T)
 // The reference implementation & the fast kernel have different rounding
 // mechanism, so we loosely compare the difference.
 void CompareRoundingResults(int flat_size, const int depth_multiplier,
@@ -164,9 +163,8 @@ void CompareRoundingResults(int flat_size, const int depth_multiplier,
 
   // The tolerance that we apply to means is tight, but we allow for a rounding
   // difference in one pixel, and loosen by another 1% for float comparison.
-  float mean_tolerance =
-      std::max(1e-5f, 1.01f / flat_size * std::sqrt(1.f * depth_multiplier));
-  mean_tolerance = 500.f;
+  const float mean_tolerance =
+      std::max(1e-2f, 1.01f / flat_size * std::sqrt(1.f * depth_multiplier));
   const int diff_mean_tolerance = 256;
   const int diff_median_tolerance = 225;
 
@@ -187,7 +185,6 @@ void CompareRoundingResults(int flat_size, const int depth_multiplier,
               std::abs(min_diff) <= diff_mean_tolerance &&
               std::abs(max_diff) <= diff_mean_tolerance);
 }
-#endif
 
 bool GenerateValidShapeConfigurations(
     int filter_width, int filter_height, int depth_multiplier,
@@ -293,7 +290,7 @@ void TryTestOneDepthwiseConv3x3Filter() {
   // It's hard to come up with a right multiplier, random guess basically makes
   // all the results saturated and becomes meaningfulless, so we first use
   // reference impl to poke the min/max value of the accumulation, then use that
-  // value as a guided suggestion for us to populate meaningful mulitplier &
+  // value as a guided suggestion for us to populate meaningful multiplier &
   // shift.
   PickReasonableMultiplier(
       params, output_activation_min, output_activation_max, output_depth,
@@ -308,7 +305,7 @@ void TryTestOneDepthwiseConv3x3Filter() {
       dilation_width_factor, dilation_height_factor, pad_width, pad_height,
       depth_multiplier, output_shape_inference, 0, output_shift.data()));
 
-  // The following tests compare referene impl and Neon general impl agrees,
+  // The following tests compare reference impl and Neon general impl agrees,
   // and reference impl loosely agrees with fast kernel since they use different
   // rounding strategy.
   reference_integer_ops::DepthwiseConvPerChannel(
@@ -325,7 +322,11 @@ void TryTestOneDepthwiseConv3x3Filter() {
       /*thread_start=*/0,
       /*thread_end=*/output_shape_inference.Dims(1), /*thread_dim=*/1);
 
-  EXPECT_EQ(reference_output_data, neon_output_data);
+  // We have changed our rounding strategy to the ARM rounding-right-shift
+  // instruction: breaking tie upward as it's much simpler.
+  // So we allow some difference for the neon output VS. the reference output.
+  CompareRoundingResults(output_buffer_size, depth_multiplier,
+                         reference_output_data.data(), neon_output_data.data());
 
 #if defined(__aarch64__) && !defined(GOOGLE_L4T)
   std::vector<std::int8_t> fast_kernel_output_data(output_buffer_size);
@@ -345,7 +346,7 @@ void TryTestOneDepthwiseConv3x3Filter() {
 }
 
 TEST(QuantizedDepthwiseConvPerChannelTest, FastKernelTest) {
-  for (int i = 0; i < 30; ++i) {
+  for (int i = 0; i < 60; ++i) {
     TryTestOneDepthwiseConv3x3Filter();
   }
 }

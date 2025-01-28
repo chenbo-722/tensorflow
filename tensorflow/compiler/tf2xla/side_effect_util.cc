@@ -31,7 +31,10 @@ const char kXlaReplicaIdAttrName[] = "_xla_replica_id";
 const char kXlaIsPlaceholderForTailOcAttrName[] =
     "_xla_is_placeholder_for_tail_oc";
 
-Status SetDeviceOrdinalAttributeForNode(Node* node, int device_ordinal) {
+const char kXlaOriginalOutsideCompilationNodeName[] =
+    "_xla_original_oc_node_name";
+
+absl::Status SetDeviceOrdinalAttributeForNode(Node* node, int device_ordinal) {
   if (!HasNodeAttr(node->def(), kXlaHasHostTransferAttrName)) {
     return errors::InvalidArgument("Node ", node->DebugString(),
                                    " does not have attribute ",
@@ -71,7 +74,7 @@ Status SetDeviceOrdinalAttributeForNode(Node* node, int device_ordinal) {
     return errors::Internal("Unknown node type to set 'device_ordinal': ",
                             node->DebugString());
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 std::set<std::string> CalculateTokenInputsForOutputToken(const Graph& g) {
@@ -92,7 +95,11 @@ std::set<std::string> CalculateTokenInputsForOutputToken(const Graph& g) {
                }
 
                first_side_effecting_node_on_path = n;
-               results.insert(n->name());
+               string original_node_name;
+               TF_CHECK_OK(GetNodeAttr(n->def(),
+                                       kXlaOriginalOutsideCompilationNodeName,
+                                       &original_node_name));
+               results.insert(original_node_name);
              },
              [&](Node* n) {
                if (first_side_effecting_node_on_path == n) {
@@ -115,8 +122,9 @@ bool HasSideEffectingNodes(const Graph& g) {
   return false;
 }
 
-Status ParseHostComputeCoreList(absl::Span<const string> list_from_attr,
-                                std::map<string, int>* host_compute_core) {
+absl::Status ParseHostComputeCoreList(
+    absl::Span<const string> list_from_attr,
+    std::map<string, int>* host_compute_core) {
   for (const auto& hc_core : list_from_attr) {
     std::vector<string> parts = str_util::Split(hc_core, ":");
     if (parts.size() != 2) {
@@ -136,7 +144,7 @@ Status ParseHostComputeCoreList(absl::Span<const string> list_from_attr,
     }
     (*host_compute_core)[parts[0]] = core;
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace tensorflow

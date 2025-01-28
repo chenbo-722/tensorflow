@@ -16,12 +16,27 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_MLIR_LITE_TF_TO_TFL_FLATBUFFER_H_
 #define TENSORFLOW_COMPILER_MLIR_LITE_TF_TO_TFL_FLATBUFFER_H_
 
+#include <memory>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/SourceMgr.h"
-#include "mlir/IR/MLIRContext.h"  // TF:local_config_mlir
-#include "mlir/IR/Module.h"  // TF:local_config_mlir
-#include "mlir/Pass/PassManager.h"  // TF:local_config_mlir
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/stream_executor/lib/statusor.h"
+#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/OwningOpRef.h"  // from @llvm-project
+#include "mlir/Pass/PassManager.h"  // from @llvm-project
+#include "tensorflow/cc/saved_model/loader.h"
+#include "tensorflow/compiler/mlir/lite/common/tfl_pass_config.h"
+#include "tensorflow/compiler/mlir/lite/converter_flags.pb.h"
+#include "tensorflow/compiler/mlir/quantization/common/quantization_lib/quantization_config.h"
+#include "tensorflow/compiler/mlir/quantization/tensorflow/python/py_function_lib.h"
+#include "tensorflow/compiler/mlir/tensorflow/translate/mlir_roundtrip_flags.h"
+#include "tensorflow/core/platform/status.h"
 
 namespace tensorflow {
 
@@ -30,27 +45,47 @@ namespace tensorflow {
 // file; otherwise, load from a GraphDef.
 // Setting prune_unused_nodes to true, would prune unreachable nodes if
 // output_arrays is specified.
-stream_executor::port::StatusOr<mlir::OwningModuleRef>
-LoadFromGraphdefOrMlirSource(
+absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> LoadFromGraphdefOrMlirSource(
     const std::string& input_filename, bool input_mlir,
     bool use_splatted_constant, const std::vector<std::string>& extra_tf_opdefs,
-    absl::string_view debug_info_file, absl::string_view input_arrays,
-    absl::string_view input_dtypes, absl::string_view input_shapes,
-    absl::string_view output_arrays, absl::string_view inference_type,
-    absl::string_view min_values, absl::string_view max_values,
-    bool prune_unused_nodes, llvm::SourceMgr* source_mgr,
+    const GraphImportConfig& specs, absl::string_view debug_info_file,
+    absl::string_view input_arrays, absl::string_view input_dtypes,
+    absl::string_view input_shapes, absl::string_view output_arrays,
+    absl::string_view control_output_arrays, llvm::SourceMgr* source_mgr,
     mlir::MLIRContext* context);
 
+// Load Saved model (either v1 or v2) into MLIR.
+// 'saved_model_bundle' will be initialized if V1 model was loaded.
+absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> ImportSavedModel(
+    const std::string& input_filename, int saved_model_version,
+    const std::unordered_set<std::string>& tags,
+    absl::Span<const std::string> extra_tf_opdefs,
+    absl::Span<std::string> exported_names, const GraphImportConfig& specs,
+    bool enable_variable_lifting, mlir::MLIRContext* context,
+    std::unique_ptr<tensorflow::SavedModelBundle>* saved_model_bundle);
+
 // Taking a MLIR module in TF executor dialect and a set of parameters,
-// applies a set of passes to convert the module to TF Lite dialect and
-// serializes the result to a string. Depending on an attribute in the module
-// main function, Quantization is applied. If `export_to_mlir` is true, the
-// result is exported in MLIR text format, otherwise exported in flat buffer.
-Status ConvertTFExecutorToTFLOrFlatbuffer(
-    mlir::ModuleOp module, bool export_to_mlir, bool emit_builtin_tflite_ops,
-    bool emit_select_tf_ops, bool emit_custom_ops, bool emit_quant_adaptor_ops,
-    bool lower_tensor_list_ops, std::string* result,
-    mlir::PassManager* pass_manager);
+// applies a set of passes (configured accordingly to the provided
+// `pass_config`) to convert the module to TF Lite dialect and serializes the
+// result to a string. Depending on an attribute in the module main function,
+// full integer quantization is applied.
+// * `quantizated_buffer_type` can be set to INT8 or FLOAT16 to trigger the
+// corresponding weight quantization.
+// * `export_to_mlir` enables exporting to MLIR text format, otherwise exported
+// in flat buffer. If the
+// * `session` pointer may provided, it will be used to freeze resource
+// variables. If the `saved_model_dir` directory path is provided, then the
+// `tf_saved_model.asset` ops will be freezed.
+absl::Status ConvertTFExecutorToTFLOrFlatbuffer(
+    std::unique_ptr<mlir::MLIRContext>&& context,
+    mlir::OwningOpRef<mlir::ModuleOp> module,
+    tflite::ConverterFlags& converter_flags,
+    const mlir::TFL::PassConfig& pass_config,
+    const std::unordered_set<std::string>& saved_model_tags,
+    llvm::StringRef saved_model_dir, std::string* result,
+    bool serialize_stablehlo_ops, bool export_to_mlir,
+    const quantization::PyFunctionLibrary* quantization_py_function_lib =
+        nullptr);
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_COMPILER_MLIR_LITE_TF_TO_TFL_FLATBUFFER_H_

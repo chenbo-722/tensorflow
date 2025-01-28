@@ -48,7 +48,7 @@ void ExecutorFactory::Register(const string& executor_type,
 
 namespace {
 const string RegisteredFactoriesErrorMessageLocked()
-    SHARED_LOCKS_REQUIRED(executor_factory_lock) {
+    TF_SHARED_LOCKS_REQUIRED(executor_factory_lock) {
   std::vector<string> factory_types;
   for (const auto& executor_factory : *executor_factories()) {
     factory_types.push_back(executor_factory.first);
@@ -58,8 +58,8 @@ const string RegisteredFactoriesErrorMessageLocked()
 }
 }  // namespace
 
-Status ExecutorFactory::GetFactory(const string& executor_type,
-                                   ExecutorFactory** out_factory) {
+absl::Status ExecutorFactory::GetFactory(const string& executor_type,
+                                         ExecutorFactory** out_factory) {
   tf_shared_lock l(executor_factory_lock);
 
   auto iter = executor_factories()->find(executor_type);
@@ -70,13 +70,12 @@ Status ExecutorFactory::GetFactory(const string& executor_type,
   }
 
   *out_factory = iter->second;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status NewExecutor(const string& executor_type,
-                   const LocalExecutorParams& params,
-                   std::unique_ptr<const Graph> graph,
-                   std::unique_ptr<Executor>* out_executor) {
+absl::Status NewExecutor(const string& executor_type,
+                         const LocalExecutorParams& params, const Graph& graph,
+                         std::unique_ptr<Executor>* out_executor) {
   ExecutorFactory* factory = nullptr;
   TF_RETURN_IF_ERROR(ExecutorFactory::GetFactory(executor_type, &factory));
   return factory->NewExecutor(params, std::move(graph), out_executor);

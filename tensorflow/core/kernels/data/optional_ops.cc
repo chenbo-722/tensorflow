@@ -12,6 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
+#define EIGEN_USE_THREADS
+
 #include "tensorflow/core/kernels/data/optional_ops.h"
 
 #include "tensorflow/core/common_runtime/dma_helper.h"
@@ -23,7 +26,7 @@ namespace tensorflow {
 namespace data {
 namespace {
 
-static Status OptionalDeviceCopy(
+static absl::Status OptionalDeviceCopy(
     const OptionalVariant& from, OptionalVariant* to,
     const UnaryVariantOpRegistry::AsyncTensorDeviceCopyFn& copy) {
   if (from.has_value()) {
@@ -47,7 +50,7 @@ static Status OptionalDeviceCopy(
   } else {
     *to = from;
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 #define REGISTER_OPTIONAL_COPY(DIRECTION)               \
@@ -99,14 +102,14 @@ void OptionalGetValueOp::Compute(OpKernelContext* ctx) {
   OP_REQUIRES_OK(ctx, ctx->input("optional", &optional_input));
   OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(optional_input->shape()),
               errors::InvalidArgument(
-                  "Input to OptionalHasValue must be a scalar tensor "
+                  "Input to OptionalGetValue must be a scalar tensor "
                   "containing an OptionalVariant object."));
   const OptionalVariant* optional =
       optional_input->scalar<Variant>()().get<OptionalVariant>();
   OP_REQUIRES(
       ctx, optional != nullptr,
       errors::InvalidArgument(
-          "Input to OptionalHasValue must be an OptionalVariant object."));
+          "Input to OptionalGetValue must be an OptionalVariant object."));
   OP_REQUIRES(
       ctx, optional->has_value(),
       errors::InvalidArgument("The given optional does not have a value."));
@@ -132,8 +135,9 @@ void OptionalGetValueOp::Compute(OpKernelContext* ctx) {
   }
 }
 
-Status WriteOptionalWithValueToOutput(OpKernelContext* ctx, int output_index,
-                                      std::vector<Tensor> value) {
+absl::Status WriteOptionalWithValueToOutput(OpKernelContext* ctx,
+                                            int output_index,
+                                            std::vector<Tensor> value) {
   OptionalVariant v(std::move(value));
   Tensor* variant_t;
   AllocatorAttributes cpu_alloc;
@@ -141,10 +145,10 @@ Status WriteOptionalWithValueToOutput(OpKernelContext* ctx, int output_index,
   TF_RETURN_IF_ERROR(ctx->allocate_output(output_index, TensorShape({}),
                                           &variant_t, cpu_alloc));
   variant_t->scalar<Variant>()() = v;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status WriteOptionalNoneToOutput(OpKernelContext* ctx, int output_index) {
+absl::Status WriteOptionalNoneToOutput(OpKernelContext* ctx, int output_index) {
   OptionalVariant v;
   Tensor* variant_t;
   AllocatorAttributes cpu_alloc;
@@ -152,7 +156,7 @@ Status WriteOptionalNoneToOutput(OpKernelContext* ctx, int output_index) {
   TF_RETURN_IF_ERROR(ctx->allocate_output(output_index, TensorShape({}),
                                           &variant_t, cpu_alloc));
   variant_t->scalar<Variant>()() = v;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 namespace {

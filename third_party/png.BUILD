@@ -30,12 +30,12 @@ cc_library(
         "pngwutil.c",
     ] + select({
         ":windows": [
-            "intel/intel_init.c",
             "intel/filter_sse2_intrinsics.c",
+            "intel/intel_init.c",
         ],
-        "@org_tensorflow//tensorflow:linux_ppc64le": [
-            "powerpc/powerpc_init.c",
+        "@local_xla//xla/tsl:linux_ppc64le": [
             "powerpc/filter_vsx_intrinsics.c",
+            "powerpc/powerpc_init.c",
         ],
         "//conditions:default": [
         ],
@@ -54,14 +54,14 @@ cc_library(
         "//conditions:default": ["-lm"],
     }),
     visibility = ["//visibility:public"],
-    deps = ["@zlib_archive//:zlib"],
+    deps = ["@zlib"],
 )
 
 genrule(
     name = "snappy_stubs_public_h",
     srcs = ["scripts/pnglibconf.h.prebuilt"],
     outs = ["pnglibconf.h"],
-    cmd = "sed -e 's/PNG_ZLIB_VERNUM 0/PNG_ZLIB_VERNUM 0x12b0/' $< >$@",
+    cmd = "sed -e 's/PNG_ZLIB_VERNUM 0/PNG_ZLIB_VERNUM 0x1310/' $< >$@",
 )
 
 config_setting(

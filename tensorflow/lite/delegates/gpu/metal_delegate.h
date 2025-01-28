@@ -18,8 +18,13 @@ limitations under the License.
 
 #import <Metal/Metal.h>
 
+#include "tensorflow/lite/core/c/common.h"
+
 #ifdef __cplusplus
 extern "C" {
+#else
+// For "C" 'bool' is not built-in type.
+#include <stdbool.h>
 #endif  // __cplusplus
 
 typedef struct TfLiteDelegate TfLiteDelegate;
@@ -43,26 +48,37 @@ typedef struct {
   // Allows to quantify tensors, downcast values, process in float16 etc.
   bool allow_precision_loss;
   TFLGpuDelegateWaitType wait_type;
+  // Allows execution of integer quantized models
+  bool enable_quantization;
 } TFLGpuDelegateOptions;
+
+// Populates TFLGpuDelegateOptions as follows:
+//   allow_precision_loss = false;
+//   wait_type = TFLGpuDelegateWaitType::TFLGpuDelegateWaitTypePassive;
+//   enable_quantization = true;
+TFL_CAPI_EXPORT extern TFLGpuDelegateOptions TFLGpuDelegateOptionsDefault(void);
 
 // Creates a new delegate instance that need to be destroyed with
 // `TFLDeleteTfLiteGpuDelegate` when delegate is no longer used by TFLite.
 // When `options` is set to `nullptr`, the following default values are used:
 // .precision_loss_allowed = false,
 // .wait_type = kPassive,
-TfLiteDelegate* TFLGpuDelegateCreate(const TFLGpuDelegateOptions* options);
+TFL_CAPI_EXPORT extern TfLiteDelegate* TFLGpuDelegateCreate(
+    const TFLGpuDelegateOptions* options);
 
 // Destroys a delegate created with `TFLGpuDelegateCreate` call.
-void TFLGpuDelegateDelete(TfLiteDelegate* delegate);
+TFL_CAPI_EXPORT extern void TFLGpuDelegateDelete(TfLiteDelegate* delegate);
 
 // Binds Metal buffer to an input or an output tensor in the initialized
 // delegate. Bound buffer should have sufficient storage to accommodate all
-// elements of a tensor. Returns non-zero on success, or zero otherwise.
+// elements of a tensor. For quantized model, the buffer is bound to internal
+// dequantized float32 tensor.
+// Returns non-zero on success, or zero otherwise.
 //
-// *** Must be called *before* `Interpreter::ModifyGraphWithDelegate`. ***
-bool TFLGpuDelegateBindMetalBufferToTensor(TfLiteDelegate* delegate,
-                                           int tensor_index,
-                                           id<MTLBuffer> metal_buffer);
+// *** Must be called *after* `Interpreter::ModifyGraphWithDelegate`. ***
+// WARNING: This is an experimental API and subject to change.
+TFL_CAPI_EXPORT extern bool TFLGpuDelegateBindMetalBufferToTensor(
+    TfLiteDelegate* delegate, int tensor_index, id<MTLBuffer> metal_buffer);
 
 #ifdef __cplusplus
 }  // extern "C"

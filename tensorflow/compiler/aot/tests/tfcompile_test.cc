@@ -13,11 +13,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
+#include <vector>
 #define EIGEN_USE_THREADS
 #define EIGEN_USE_CUSTOM_THREAD_POOL
 
 #include "absl/strings/str_split.h"
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
+#include "xla/hlo/testlib/test.h"
+#include "xla/service/hlo_profile_printer.h"
+#include "xla/shape_util.h"
+#include "tensorflow/core/platform/regexp.h"
+#include "tensorflow/core/platform/test.h"
+
 #include "tensorflow/compiler/aot/tests/test_graph_tfadd.h"
 #include "tensorflow/compiler/aot/tests/test_graph_tfadd_with_ckpt.h"
 #include "tensorflow/compiler/aot/tests/test_graph_tfadd_with_ckpt_saver.h"
@@ -31,13 +39,8 @@ limitations under the License.
 #include "tensorflow/compiler/aot/tests/test_graph_tfsplits.h"
 #include "tensorflow/compiler/aot/tests/test_graph_tftop_k.h"
 #include "tensorflow/compiler/aot/tests/test_graph_tfvariable.h"
+#include "tensorflow/compiler/aot/tests/test_graph_tfvariable_readonly.h"
 #include "tensorflow/compiler/aot/tests/test_graph_tfvariable_sequential_updates.h"
-#include "tensorflow/compiler/xla/service/hlo_profile_printer.h"
-#include "tensorflow/compiler/xla/shape_util.h"
-#include "tensorflow/compiler/xla/test.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
-#include "tensorflow/core/platform/regexp.h"
-#include "tensorflow/core/platform/test.h"
 
 namespace tensorflow {
 namespace tfcompile {
@@ -474,6 +477,20 @@ TEST(TFCompileTest, TopK) {
   EXPECT_EQ(expected_values[1], fn.result0(1));
   EXPECT_EQ(expected_indices[0], fn.result1(0));
   EXPECT_EQ(expected_indices[1], fn.result1(1));
+}
+
+TEST(TFCompileTest, VariableReadonly) {
+  Eigen::ThreadPool tp(1);
+  Eigen::ThreadPoolDevice device(&tp, tp.NumThreads());
+
+  VariableReadonlyComp fn;
+  float x = 23;
+  fn.set_var_x_data(&x);
+
+  fn.set_thread_pool(&device);
+  fn.Run();
+  EXPECT_EQ(fn.result0(), 65);
+  EXPECT_EQ(fn.var_x(), 23);
 }
 
 TEST(TFCompileTest, Variable) {

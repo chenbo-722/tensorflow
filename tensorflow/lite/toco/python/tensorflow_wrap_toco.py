@@ -13,12 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 """Stub to make toco convert accessible."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 # TODO(aselle): Remove once no clients internally depend on this.
 
 # pylint: disable=unused-import
-from tensorflow.python.pywrap_tensorflow import TocoConvert
+from tensorflow.python._pywrap_toco_api import TocoConvert
 # pylint: enable=unused-import

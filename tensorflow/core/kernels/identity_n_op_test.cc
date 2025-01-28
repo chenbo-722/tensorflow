@@ -20,6 +20,7 @@ limitations under the License.
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/kernels/ops_testutil.h"
 #include "tensorflow/core/kernels/ops_util.h"
+#include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/test.h"
 
@@ -28,7 +29,7 @@ namespace {
 
 class IdentityNOpTest : public OpsTestBase {
  protected:
-  Status Init(DataType input0_type, DataType input1_type) {
+  absl::Status Init(DataType input0_type, DataType input1_type) {
     TF_CHECK_OK(NodeDefBuilder("op", "IdentityN")
                     .Input(FakeInput({input0_type, input1_type}))
                     .Finalize(node_def()));
